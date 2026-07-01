@@ -1,47 +1,52 @@
-import streamlit as st
-from __future__ import annotations
-import sys
+"""
+Streamlit app — GPX Equivalent Flat Distance (EFD)
+====================================================
+Upload a GPX trace and compute the bioenergetic Equivalent Flat Distance,
+based on Minetti et al. (2002)'s slope-dependent energy cost of running,
+following the logic in Veronique Billat's article on why
+"1000 m ascent = 10 km flat" is a poor approximation.
+
+Run with:
+    streamlit run streamlit_app.py
+"""
+
+import io
 import math
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from plotly.subplots import make_subplots
+
+st.set_page_config(page_title="GPX Equivalent Flat Distance", layout="wide")
 
 
 # ---------------------------------------------------------------------------
-# 1. Energy cost of running as a function of slope (Minetti et al. 2002)
+# Energy cost of running as a function of slope (Minetti et al. 2002)
 # ---------------------------------------------------------------------------
-def cost_of_running(slope: float) -> float:
+def cost_of_running(slope: np.ndarray) -> np.ndarray:
     """
-    Mass-specific energy cost of running, in J/(kg*m), as a function of
-    slope 'i' (decimal fraction, e.g. 0.10 = +10% uphill, -0.10 = -10% downhill).
-
-    Minetti's polynomial fit, valid roughly for -0.45 <= i <= +0.45.
-    Outside that range the slope is clamped, since the fit isn't
-    empirically supported beyond it (real GPX segments this steep are
-    almost always smoothing/noise artifacts anyway).
+    Mass-specific energy cost of running, J/(kg*m), as a function of slope
+    (decimal fraction). Vectorized. Clamped to +/-45% since the polynomial
+    fit isn't empirically supported beyond that range.
     """
-    i = max(-0.45, min(0.45, slope))
+    i = np.clip(slope, -0.45, 0.45)
     return (155.4 * i**5 - 30.4 * i**4 - 43.3 * i**3
             + 46.3 * i**2 + 19.5 * i + 3.6)
 
 
-FLAT_COST = cost_of_running(0.0)  # 3.6 J/kg/m, by construction
+FLAT_COST = float(cost_of_running(np.array([0.0]))[0])  # 3.6 J/kg/m
 
 
 # ---------------------------------------------------------------------------
-# 2. GPX parsing (no external dependencies required)
+# GPX parsing
 # ---------------------------------------------------------------------------
-@dataclass
-class Point:
-    lat: float
-    lon: float
-    ele: float  # meters
-
-
-def parse_gpx(path: str) -> list[Point]:
-    tree = ET.parse(path)
+def parse_gpx(file_obj) -> pd.DataFrame:
+    tree = ET.parse(file_obj)
     root = tree.getroot()
 
-    # Auto-detect the GPX namespace from the root tag
     ns_uri = root.tag[1:root.tag.index("}")] if root.tag.startswith("{") else ""
     ns = {"gpx": ns_uri} if ns_uri else {}
 
@@ -51,168 +56,217 @@ def parse_gpx(path: str) -> list[Point]:
     def find_child(el, tag):
         return el.find(f"gpx:{tag}", ns) if ns else el.find(tag)
 
-    points = []
+    rows = []
     for trkpt in findall("trkpt"):
         lat = float(trkpt.get("lat"))
         lon = float(trkpt.get("lon"))
         ele_el = find_child(trkpt, "ele")
         ele = float(ele_el.text) if ele_el is not None and ele_el.text else 0.0
-        points.append(Point(lat, lon, ele))
+        rows.append((lat, lon, ele))
 
-    if not points:
-        # Fall back to route/way points if there's no track
+    if not rows:
         for tag in ("rtept", "wpt"):
             for pt in findall(tag):
                 lat = float(pt.get("lat"))
                 lon = float(pt.get("lon"))
                 ele_el = find_child(pt, "ele")
                 ele = float(ele_el.text) if ele_el is not None and ele_el.text else 0.0
-                points.append(Point(lat, lon, ele))
+                rows.append((lat, lon, ele))
 
-    return points
+    return pd.DataFrame(rows, columns=["lat", "lon", "ele"])
 
 
-def haversine(lat1, lon1, lat2, lon2) -> float:
-    """Great-circle distance between two lat/lon points, in meters."""
+def haversine_vec(lat1, lon1, lat2, lon2):
+    """Vectorized great-circle distance in meters between arrays of points."""
     R = 6371000.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = (math.sin(dphi / 2) ** 2
-         + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2)
-    return 2 * R * math.asin(math.sqrt(a))
+    phi1, phi2 = np.radians(lat1), np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+    a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2) ** 2
+    return 2 * R * np.arcsin(np.sqrt(a))
 
 
 # ---------------------------------------------------------------------------
-# 3. Elevation smoothing (raw GPX elevation is noisy -> slope noise blows up cost)
+# Core pipeline: smooth -> resample onto uniform distance grid -> cost
 # ---------------------------------------------------------------------------
-def smooth_elevation(points: list[Point], window: int = 5) -> list[Point]:
-    if window <= 1 or len(points) < window:
-        return points
-    eles = [p.ele for p in points]
-    half = window // 2
-    smoothed = []
-    for idx in range(len(eles)):
-        lo, hi = max(0, idx - half), min(len(eles), idx + half + 1)
-        smoothed.append(sum(eles[lo:hi]) / (hi - lo))
-    return [Point(p.lat, p.lon, s) for p, s in zip(points, smoothed)]
+def process_track(df: pd.DataFrame, smooth_window: int, resample_step_m: float):
+    lat, lon, ele = df["lat"].to_numpy(), df["lon"].to_numpy(), df["ele"].to_numpy()
 
+    # Smooth elevation (rolling mean, vectorized via pandas)
+    ele_smooth = (pd.Series(ele)
+                  .rolling(window=smooth_window, center=True, min_periods=1)
+                  .mean()
+                  .to_numpy())
 
-# ---------------------------------------------------------------------------
-# 4. Core EFD calculation
-# ---------------------------------------------------------------------------
-@dataclass
-class EFDResult:
-    horizontal_distance_m: float
-    d_plus_m: float
-    d_minus_m: float
-    total_energy_j_per_kg: float
-    efd_m: float
-    naive_efd_m: float  # "1000 m D+ = 10 km flat" rule, for comparison
+    # Cumulative distance along the raw trace (vectorized haversine)
+    seg_dist = haversine_vec(lat[:-1], lon[:-1], lat[1:], lon[1:])
+    cum_dist = np.concatenate([[0.0], np.cumsum(seg_dist)])
+    total_dist = cum_dist[-1]
 
-    @property
-    def horizontal_distance_km(self): return self.horizontal_distance_m / 1000
-    @property
-    def efd_km(self): return self.efd_m / 1000
-    @property
-    def naive_efd_km(self): return self.naive_efd_m / 1000
+    # Resample onto a uniform horizontal-distance grid via interpolation
+    n_steps = max(2, int(total_dist // resample_step_m))
+    grid = np.linspace(0.0, total_dist, n_steps)
+    ele_grid = np.interp(grid, cum_dist, ele_smooth)
+    lat_grid = np.interp(grid, cum_dist, lat)
+    lon_grid = np.interp(grid, cum_dist, lon)
 
-    @property
-    def overestimation_pct(self):
-        return 100 * (self.naive_efd_m - self.efd_m) / self.efd_m
+    dx = np.diff(grid)                 # horizontal distance per segment (uniform)
+    dz = np.diff(ele_grid)             # vertical change per segment
+    dist3d = np.hypot(dx, dz)
+    slope = np.divide(dz, dx, out=np.zeros_like(dz), where=dx > 0)
 
+    cost = cost_of_running(slope)      # J/(kg*m)
+    energy = cost * dist3d             # J/kg per segment
 
-def compute_efd(points: list[Point], min_segment_m: float = 3.0) -> EFDResult:
-    """
-    Walk the trace segment by segment, compute local slope, look up the
-    Minetti cost per meter at that slope, and integrate total energy.
-
-    Note: because EFD = total_energy / flat_cost, and energy is mass-specific
-    (J per kg), body mass cancels out entirely — EFD doesn't depend on the
-    runner's weight, only on the trace's shape.
-
-    min_segment_m: segments shorter than this are accumulated into the next
-    one before computing slope, since very short segments massively amplify
-    GPS/elevation noise (a 1 m horizontal step with 0.5 m of elevation noise
-    looks like a 50% grade).
-    """
-    total_horizontal = 0.0
-    d_plus = 0.0
-    d_minus = 0.0
-    total_energy = 0.0  # J per kg of body mass
-
-    pending_horiz = 0.0
-    pending_vert = 0.0
-
-    for p0, p1 in zip(points, points[1:]):
-        dh = haversine(p0.lat, p0.lon, p1.lat, p1.lon)
-        dv = p1.ele - p0.ele
-
-        pending_horiz += dh
-        pending_vert += dv
-
-        if pending_horiz < min_segment_m:
-            continue
-
-        seg_horiz, seg_vert = pending_horiz, pending_vert
-        pending_horiz = pending_vert = 0.0
-
-        seg_dist3d = math.hypot(seg_horiz, seg_vert)
-        if seg_dist3d == 0:
-            continue
-
-        slope = seg_vert / seg_horiz if seg_horiz > 0 else 0.0
-
-        total_horizontal += seg_horiz
-        if seg_vert > 0:
-            d_plus += seg_vert
-        else:
-            d_minus += -seg_vert
-
-        cost = cost_of_running(slope)      # J/(kg*m)
-        total_energy += cost * seg_dist3d  # integrate over actual (3D) distance covered
-
+    d_plus = float(dz[dz > 0].sum())
+    d_minus = float(-dz[dz < 0].sum())
+    total_energy = float(energy.sum())
     efd_m = total_energy / FLAT_COST
-    naive_efd_m = total_horizontal + d_plus * 10  # "1000 m D+ = 10 km flat"
+    naive_efd_m = total_dist + d_plus * 10.0
 
-    return EFDResult(
-        horizontal_distance_m=total_horizontal,
-        d_plus_m=d_plus,
-        d_minus_m=d_minus,
-        total_energy_j_per_kg=total_energy,
-        efd_m=efd_m,
-        naive_efd_m=naive_efd_m,
+    segments = pd.DataFrame({
+        "distance_m": grid[1:],
+        "distance_km": grid[1:] / 1000,
+        "elevation_m": ele_grid[1:],
+        "lat": lat_grid[1:],
+        "lon": lon_grid[1:],
+        "slope_pct": slope * 100,
+        "cost_j_per_kg_m": cost,
+        "energy_j_per_kg": energy,
+        "cumulative_efd_km": np.cumsum(energy) / FLAT_COST / 1000,
+    })
+
+    summary = {
+        "horizontal_distance_m": total_dist,
+        "d_plus_m": d_plus,
+        "d_minus_m": d_minus,
+        "total_energy_j_per_kg": total_energy,
+        "efd_m": efd_m,
+        "naive_efd_m": naive_efd_m,
+    }
+    return segments, summary
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+st.title("🏔️ GPX Equivalent Flat Distance")
+st.caption(
+    "Bioenergetic alternative to the '1000 m D+ = 10 km flat' rule, "
+    "using Minetti et al. (2002)'s slope-dependent cost of running."
+)
+
+with st.sidebar:
+    st.header("Settings")
+    uploaded = st.file_uploader("Upload a GPX file", type=["gpx"])
+    smooth_window = st.slider("Elevation smoothing window (points)", 1, 31, 9, step=2)
+    resample_step = st.slider("Resample step (m)", 5, 100, 20, step=5)
+    st.caption(
+        "Smoothing denoises raw GPS/barometric elevation before slope is computed. "
+        "Resample step controls the horizontal resolution used to integrate energy."
     )
 
+if uploaded is None:
+    st.info("Upload a GPX file to begin.")
+    st.stop()
 
-# ---------------------------------------------------------------------------
-# 5. CLI
-# ---------------------------------------------------------------------------
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python gpx_efd.py <trace.gpx> [smoothing_window]")
-        sys.exit(1)
+df_points = parse_gpx(io.BytesIO(uploaded.getvalue()))
+if len(df_points) < 2:
+    st.error("Not enough track points found in this GPX file.")
+    st.stop()
 
-    gpx_path = sys.argv[1]
-    window = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+segments, summary = process_track(df_points, smooth_window, resample_step)
+overestimation_pct = 100 * (summary["naive_efd_m"] - summary["efd_m"]) / summary["efd_m"]
 
-    points = parse_gpx(gpx_path)
-    if len(points) < 2:
-        print("Not enough track points found in GPX file.")
-        sys.exit(1)
+# --- Metrics ---
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Horizontal distance", f"{summary['horizontal_distance_m']/1000:.2f} km")
+c2.metric("D+ / D−", f"{summary['d_plus_m']:.0f} m / {summary['d_minus_m']:.0f} m")
+c3.metric("Equivalent Flat Distance", f"{summary['efd_m']/1000:.2f} km")
+c4.metric(
+    "Naive '1000m=10km' estimate",
+    f"{summary['naive_efd_m']/1000:.2f} km",
+    delta=f"{overestimation_pct:+.1f}% vs EFD",
+    delta_color="inverse",
+)
 
-    points = smooth_elevation(points, window=window)
-    result = compute_efd(points)
+st.divider()
 
-    print(f"File: {gpx_path}")
-    print(f"Track points: {len(points)} (elevation smoothing window: {window})")
-    print(f"Horizontal distance: {result.horizontal_distance_km:.2f} km")
-    print(f"D+: {result.d_plus_m:.0f} m   D-: {result.d_minus_m:.0f} m")
-    print()
-    print(f"Bioenergetic Equivalent Flat Distance (EFD): {result.efd_km:.2f} km")
-    print(f"Naive '1000 m D+ = 10 km' estimate:           {result.naive_efd_km:.2f} km")
-    print(f"Naive rule overestimates EFD by: {result.overestimation_pct:+.1f}%")
+# --- Elevation profile + cost intensity ---
+fig = make_subplots(
+    rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4],
+    vertical_spacing=0.06,
+    subplot_titles=("Elevation profile", "Energy cost per meter along the route"),
+)
+fig.add_trace(
+    go.Scatter(
+        x=segments["distance_km"], y=segments["elevation_m"],
+        mode="lines", fill="tozeroy", name="Elevation",
+        line=dict(color="#6b7280"),
+    ),
+    row=1, col=1,
+)
+fig.add_trace(
+    go.Scatter(
+        x=segments["distance_km"], y=segments["cost_j_per_kg_m"],
+        mode="lines", name="Cost (J/kg/m)",
+        line=dict(color="#dc2626"),
+    ),
+    row=2, col=1,
+)
+fig.add_hline(y=FLAT_COST, line_dash="dot", line_color="gray",
+              annotation_text="flat cost (3.6)", row=2, col=1)
+fig.update_layout(height=550, showlegend=False, margin=dict(t=40, b=10))
+fig.update_xaxes(title_text="Distance (km)", row=2, col=1)
+fig.update_yaxes(title_text="Elevation (m)", row=1, col=1)
+fig.update_yaxes(title_text="J/kg/m", row=2, col=1)
+st.plotly_chart(fig, use_container_width=True)
 
+# --- Cumulative EFD vs naive linear distance ---
+fig2 = go.Figure()
+fig2.add_trace(go.Scatter(
+    x=segments["distance_km"], y=segments["cumulative_efd_km"],
+    mode="lines", name="Cumulative EFD", line=dict(color="#2563eb"),
+))
+fig2.add_trace(go.Scatter(
+    x=segments["distance_km"], y=segments["distance_km"],
+    mode="lines", name="Raw horizontal distance", line=dict(color="#9ca3af", dash="dash"),
+))
+fig2.update_layout(
+    title="Cumulative Equivalent Flat Distance vs. raw distance covered",
+    xaxis_title="Actual distance (km)", yaxis_title="Equivalent flat km",
+    height=350, margin=dict(t=40, b=10),
+)
+st.plotly_chart(fig2, use_container_width=True)
 
-if __name__ == "__main__":
-    main()
+# --- Route map colored by cost ---
+st.subheader("Route colored by energy cost")
+fig3 = go.Figure(go.Scattermapbox(
+    lat=segments["lat"], lon=segments["lon"],
+    mode="markers+lines",
+    marker=dict(size=5, color=segments["cost_j_per_kg_m"], colorscale="RdYlGn_r",
+                colorbar=dict(title="J/kg/m")),
+    line=dict(width=2, color="#3b82f6"),
+))
+fig3.update_layout(
+    mapbox=dict(
+        style="open-street-map",
+        center=dict(lat=segments["lat"].mean(), lon=segments["lon"].mean()),
+        zoom=10,
+    ),
+    height=500, margin=dict(t=0, b=0, l=0, r=0),
+)
+st.plotly_chart(fig3, use_container_width=True)
+
+# --- Data export ---
+st.divider()
+csv_bytes = segments.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "Download segment data (CSV)",
+    data=csv_bytes,
+    file_name=f"{uploaded.name.rsplit('.', 1)[0]}_efd_segments.csv",
+    mime="text/csv",
+)
+
+with st.expander("Segment data preview"):
+    st.dataframe(segments.head(50), use_container_width=True)

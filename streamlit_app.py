@@ -1,26 +1,28 @@
 """
-Streamlit app — GPX Equivalent Flat Distance (EFD)
-====================================================
-Upload a GPX trace and compute the bioenergetic Equivalent Flat Distance,
-based on Minetti et al. (2002)'s slope-dependent energy cost of running,
-following the logic in Veronique Billat's article on why
-"1000 m ascent = 10 km flat" is a poor approximation.
+Streamlit app — .fit Equivalent Flat Distance / Equivalent Flat Speed per zona FC
+==================================================================================
+Carica una o più tracce .fit e calcola, per ciascun segmento:
+  - EFD (Equivalent Flat Distance), da Minetti et al. (2002)
+  - tempo del segmento
+  - EFS (Equivalent Flat Speed) = EFD_segmento / tempo_segmento
+  - zona cardiaca prevalente del segmento
+
+In output: velocità media EFS per ogni zona cardiaca, per ciascun file, più un
+riepilogo finale aggregato su tutti i file caricati.
 
 Run with:
     streamlit run streamlit_app.py
 """
 
 import io
-import math
-import xml.etree.ElementTree as ET
-
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-from plotly.subplots import make_subplots
+from fitparse import FitFile
 
-st.set_page_config(page_title="GPX Equivalent Flat Distance", layout="wide")
+st.set_page_config(page_title="FIT — EFD/EFS per zona FC", layout="wide")
+
+MIN_FILE_DURATION_S = 10 * 60  # file sotto questa durata esclusi dal riepilogo finale
 
 
 # ---------------------------------------------------------------------------
@@ -29,8 +31,7 @@ st.set_page_config(page_title="GPX Equivalent Flat Distance", layout="wide")
 def cost_of_running(slope: np.ndarray) -> np.ndarray:
     """
     Mass-specific energy cost of running, J/(kg*m), as a function of slope
-    (decimal fraction). Vectorized. Clamped to +/-45% since the polynomial
-    fit isn't empirically supported beyond that range.
+    (decimal fraction). Vectorized. Clamped to +/-45%.
     """
     i = np.clip(slope, -0.45, 0.45)
     return (155.4 * i**5 - 30.4 * i**4 - 43.3 * i**3
@@ -38,42 +39,42 @@ def cost_of_running(slope: np.ndarray) -> np.ndarray:
 
 
 FLAT_COST = float(cost_of_running(np.array([0.0]))[0])  # 3.6 J/kg/m
+SEMICIRCLE_TO_DEG = 180.0 / (2 ** 31)
 
 
 # ---------------------------------------------------------------------------
-# GPX parsing
+# .fit parsing
 # ---------------------------------------------------------------------------
-def parse_gpx(file_obj) -> pd.DataFrame:
-    tree = ET.parse(file_obj)
-    root = tree.getroot()
-
-    ns_uri = root.tag[1:root.tag.index("}")] if root.tag.startswith("{") else ""
-    ns = {"gpx": ns_uri} if ns_uri else {}
-
-    def findall(tag):
-        return root.findall(f".//gpx:{tag}", ns) if ns else root.findall(f".//{tag}")
-
-    def find_child(el, tag):
-        return el.find(f"gpx:{tag}", ns) if ns else el.find(tag)
-
+def parse_fit(file_obj) -> pd.DataFrame:
+    """Extract lat, lon, elevation, heart rate, elapsed time (s) per record."""
+    fitfile = FitFile(file_obj)
     rows = []
-    for trkpt in findall("trkpt"):
-        lat = float(trkpt.get("lat"))
-        lon = float(trkpt.get("lon"))
-        ele_el = find_child(trkpt, "ele")
-        ele = float(ele_el.text) if ele_el is not None and ele_el.text else 0.0
-        rows.append((lat, lon, ele))
+    for record in fitfile.get_messages("record"):
+        data = {f.name: f.value for f in record}
 
-    if not rows:
-        for tag in ("rtept", "wpt"):
-            for pt in findall(tag):
-                lat = float(pt.get("lat"))
-                lon = float(pt.get("lon"))
-                ele_el = find_child(pt, "ele")
-                ele = float(ele_el.text) if ele_el is not None and ele_el.text else 0.0
-                rows.append((lat, lon, ele))
+        lat_raw = data.get("position_lat")
+        lon_raw = data.get("position_long")
+        if lat_raw is None or lon_raw is None:
+            continue
 
-    return pd.DataFrame(rows, columns=["lat", "lon", "ele"])
+        lat = lat_raw * SEMICIRCLE_TO_DEG
+        lon = lon_raw * SEMICIRCLE_TO_DEG
+        ele = data.get("enhanced_altitude", data.get("altitude"))
+        hr = data.get("heart_rate")
+        ts = data.get("timestamp")
+
+        rows.append((lat, lon, ele, hr, ts))
+
+    df = pd.DataFrame(rows, columns=["lat", "lon", "ele", "hr", "timestamp"])
+    df = df.dropna(subset=["lat", "lon", "timestamp"]).reset_index(drop=True)
+
+    if df.empty:
+        return df
+
+    df["ele"] = df["ele"].astype(float).ffill().bfill().fillna(0.0)
+    df["hr"] = df["hr"].astype(float)  # may contain NaN, handled later
+    df["elapsed_s"] = (df["timestamp"] - df["timestamp"].iloc[0]).dt.total_seconds()
+    return df
 
 
 def haversine_vec(lat1, lon1, lat2, lon2):
@@ -86,54 +87,83 @@ def haversine_vec(lat1, lon1, lat2, lon2):
     return 2 * R * np.arcsin(np.sqrt(a))
 
 
-# ---------------------------------------------------------------------------
-# Core pipeline: smooth -> resample onto uniform distance grid -> cost
-# ---------------------------------------------------------------------------
-def process_track(df: pd.DataFrame, smooth_window: int, resample_step_m: float):
-    lat, lon, ele = df["lat"].to_numpy(), df["lon"].to_numpy(), df["ele"].to_numpy()
+def hr_to_zone(hr, z1, z2, z3, z4, z5):
+    if np.isnan(hr):
+        return None
+    if hr <= z1:
+        return "Z1"
+    elif hr <= z2:
+        return "Z2"
+    elif hr <= z3:
+        return "Z3"
+    elif hr <= z4:
+        return "Z4"
+    else:
+        return "Z5"
 
-    # Smooth elevation (rolling mean, vectorized via pandas)
+
+# ---------------------------------------------------------------------------
+# Core pipeline: smooth -> resample onto uniform distance grid -> cost -> EFS/zone
+# ---------------------------------------------------------------------------
+def process_track(df: pd.DataFrame, smooth_window: int, resample_step_m: float,
+                   zones: tuple):
+    lat, lon, ele = df["lat"].to_numpy(), df["lon"].to_numpy(), df["ele"].to_numpy()
+    time_s = df["elapsed_s"].to_numpy()
+    hr_raw = df["hr"].to_numpy()
+
+    # Smooth elevation (rolling mean)
     ele_smooth = (pd.Series(ele)
                   .rolling(window=smooth_window, center=True, min_periods=1)
                   .mean()
                   .to_numpy())
 
-    # Cumulative distance along the raw trace (vectorized haversine)
+    # Cumulative horizontal distance along the raw trace
     seg_dist = haversine_vec(lat[:-1], lon[:-1], lat[1:], lon[1:])
     cum_dist = np.concatenate([[0.0], np.cumsum(seg_dist)])
     total_dist = cum_dist[-1]
 
-    # Resample onto a uniform horizontal-distance grid via interpolation
+    if total_dist <= 0:
+        return None, None
+
+    # Resample onto a uniform horizontal-distance grid
     n_steps = max(2, int(total_dist // resample_step_m))
     grid = np.linspace(0.0, total_dist, n_steps)
     ele_grid = np.interp(grid, cum_dist, ele_smooth)
-    lat_grid = np.interp(grid, cum_dist, lat)
-    lon_grid = np.interp(grid, cum_dist, lon)
+    time_grid = np.interp(grid, cum_dist, time_s)
 
-    dx = np.diff(grid)                 # horizontal distance per segment (uniform)
-    dz = np.diff(ele_grid)             # vertical change per segment
+    # HR: interpolate ignoring NaNs (fill gaps first so np.interp has valid data)
+    hr_series = pd.Series(hr_raw).interpolate(limit_direction="both").to_numpy()
+    hr_grid = np.interp(grid, cum_dist, hr_series)
+
+    dx = np.diff(grid)
+    dz = np.diff(ele_grid)
+    dt = np.diff(time_grid)
     dist3d = np.hypot(dx, dz)
     slope = np.divide(dz, dx, out=np.zeros_like(dz), where=dx > 0)
 
-    cost = cost_of_running(slope)      # J/(kg*m)
-    energy = cost * dist3d             # J/kg per segment
+    cost = cost_of_running(slope)          # J/(kg*m)
+    energy = cost * dist3d                 # J/kg per segment
+    efd_m = energy / FLAT_COST             # equivalent flat meters per segment
+    efs_ms = np.divide(efd_m, dt, out=np.full_like(efd_m, np.nan), where=dt > 0)
+
+    hr_seg = (hr_grid[:-1] + hr_grid[1:]) / 2.0   # avg HR across the segment
+    zone = np.array([hr_to_zone(h, *zones) for h in hr_seg])
 
     d_plus = float(dz[dz > 0].sum())
     d_minus = float(-dz[dz < 0].sum())
     total_energy = float(energy.sum())
-    efd_m = total_energy / FLAT_COST
-    naive_efd_m = total_dist + d_plus * 10.0
+    total_efd_m = float(efd_m.sum())
+    total_time_s = float(dt.sum())
 
     segments = pd.DataFrame({
-        "distance_m": grid[1:],
         "distance_km": grid[1:] / 1000,
         "elevation_m": ele_grid[1:],
-        "lat": lat_grid[1:],
-        "lon": lon_grid[1:],
         "slope_pct": slope * 100,
-        "cost_j_per_kg_m": cost,
-        "energy_j_per_kg": energy,
-        "cumulative_efd_km": np.cumsum(energy) / FLAT_COST / 1000,
+        "dt_s": dt,
+        "efd_m": efd_m,
+        "efs_ms": efs_ms,
+        "hr_avg": hr_seg,
+        "zone": zone,
     })
 
     summary = {
@@ -141,132 +171,232 @@ def process_track(df: pd.DataFrame, smooth_window: int, resample_step_m: float):
         "d_plus_m": d_plus,
         "d_minus_m": d_minus,
         "total_energy_j_per_kg": total_energy,
-        "efd_m": efd_m,
-        "naive_efd_m": naive_efd_m,
+        "efd_m": total_efd_m,
+        "total_time_s": total_time_s,
     }
     return segments, summary
+
+
+def zone_efs_table(segments: pd.DataFrame) -> pd.DataFrame:
+    """Average EFS per HR zone = total EFD in zone / total time in zone (time-weighted)."""
+    valid = segments.dropna(subset=["zone"])
+    rows = []
+    for z in ["Z1", "Z2", "Z3", "Z4", "Z5"]:
+        zdf = valid[valid["zone"] == z]
+        if zdf.empty:
+            continue
+        total_efd = zdf["efd_m"].sum()
+        total_time = zdf["dt_s"].sum()
+        if total_time <= 0:
+            continue
+        efs_ms = total_efd / total_time
+        rows.append({
+            "Zona": z,
+            "Tempo (min)": total_time / 60,
+            "EFD (km)": total_efd / 1000,
+            "EFS media (km/h)": efs_ms * 3.6,
+        })
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
-st.title("🏔️ GPX Equivalent Flat Distance")
+st.title("🏃‍♂️ FIT — Equivalent Flat Speed per zona cardiaca")
 st.caption(
-    "Bioenergetic alternative to the '1000 m D+ = 10 km flat' rule, "
-    "using Minetti et al. (2002)'s slope-dependent cost of running."
+    "Analisi bioenergetica basata su Minetti et al. (2002): per ogni segmento calcola "
+    "distanza equivalente pianeggiante (EFD), tempo, velocità equivalente pianeggiante "
+    "(EFS) e zona cardiaca prevalente."
 )
 
-with st.sidebar:
-    st.header("Settings")
-    uploaded = st.file_uploader("Upload a GPX file", type=["gpx"])
-    smooth_window = st.slider("Elevation smoothing window (points)", 1, 31, 9, step=2)
-    resample_step = st.slider("Resample step (m)", 5, 100, 20, step=5)
-    st.caption(
-        "Smoothing denoises raw GPS/barometric elevation before slope is computed. "
-        "Resample step controls the horizontal resolution used to integrate energy."
+# --- HR Zones module ---
+default_zones = {'z1': 140, 'z2': 160, 'z3': 170, 'z4': 180, 'z5': 200}
+for zone, val in default_zones.items():
+    if zone not in st.session_state:
+        st.session_state[zone] = val
+
+st.subheader("❤️ Zone cardiache dell'atleta")
+
+input_method = st.radio("Metodo di input:", ["Manuale", "Importa CSV"], horizontal=True)
+
+if input_method == "Manuale":
+    with st.form("hr_zones_form"):
+        st.caption("Inserisci il **limite superiore (in bpm)** di ciascuna zona, poi salva:")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        z1_in = col1.number_input("Zona 1 fino a:", min_value=60, value=st.session_state['z1'])
+        z2_in = col2.number_input("Zona 2 fino a:", min_value=60, value=st.session_state['z2'])
+        z3_in = col3.number_input("Zona 3 fino a:", min_value=60, value=st.session_state['z3'])
+        z4_in = col4.number_input("Zona 4 fino a:", min_value=60, value=st.session_state['z4'])
+        z5_in = col5.number_input("Zona 5 fino a:", min_value=60, value=st.session_state['z5'])
+        submitted = st.form_submit_button("💾 Salva zone")
+
+    if submitted:
+        if not (z1_in < z2_in < z3_in < z4_in < z5_in):
+            st.error("⚠️ Le soglie FC non sono coerenti (devono essere crescenti). Zone NON salvate.")
+        else:
+            st.session_state.update({'z1': z1_in, 'z2': z2_in, 'z3': z3_in, 'z4': z4_in, 'z5': z5_in})
+            st.success("✅ Zone salvate!")
+else:
+    uploaded_hr_csv = st.file_uploader("Carica CSV zone FC:", type=["csv"], key="hr_zones_csv")
+    if uploaded_hr_csv is not None:
+        hr_df = pd.read_csv(uploaded_hr_csv)
+        required_cols = ['z1', 'z2', 'z3', 'z4', 'z5']
+        if all(col in hr_df.columns for col in required_cols):
+            z1c, z2c, z3c, z4c, z5c = hr_df.loc[0, required_cols]
+            if not (z1c < z2c < z3c < z4c < z5c):
+                st.error("⚠️ Le soglie FC nel CSV non sono coerenti (devono essere crescenti). Zone NON importate.")
+            else:
+                st.session_state.update({col: hr_df.loc[0, col] for col in required_cols})
+                athlete = hr_df.loc[0, 'athlete_name'] if 'athlete_name' in hr_df.columns else 'atleta'
+                st.success(f"✅ Zone importate correttamente per {athlete}")
+        else:
+            st.error("⚠️ Il CSV deve contenere le colonne: z1, z2, z3, z4, z5")
+
+# Le zone effettivamente usate nell'elaborazione sono sempre quelle salvate in session_state
+z1, z2, z3, z4, z5 = (st.session_state[c] for c in ["z1", "z2", "z3", "z4", "z5"])
+zones = (z1, z2, z3, z4, z5)
+
+with st.expander("📋 Zone attualmente in uso"):
+    st.write(f"""
+    - 🩵 Zona 1 (Aerobica bassa): ≤ {z1} bpm
+    - 💚 Zona 2 (Aerobica alta): {z1+1} - {z2} bpm
+    - 💛 Zona 3 (Resistenza aerobica): {z2+1} - {z3} bpm
+    - 🧡 Zona 4 (Sub soglia): {z3+1} - {z4} bpm
+    - ❤️ Zona 5 (Sopra soglia): > {z4} bpm
+    """)
+
+    athlete_name = st.session_state.get('athlete_name', 'atleta')
+    export_df = pd.DataFrame([{
+        'athlete_name': athlete_name, 'z1': z1, 'z2': z2, 'z3': z3, 'z4': z4, 'z5': z5
+    }])
+    csv_data = export_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Esporta zone in CSV",
+        data=csv_data,
+        file_name=f"{str(athlete_name).replace(' ', '_')}_HR_Zones.csv",
+        mime='text/csv'
     )
 
-if uploaded is None:
-    st.info("Upload a GPX file to begin.")
-    st.stop()
-
-df_points = parse_gpx(io.BytesIO(uploaded.getvalue()))
-if len(df_points) < 2:
-    st.error("Not enough track points found in this GPX file.")
-    st.stop()
-
-segments, summary = process_track(df_points, smooth_window, resample_step)
-overestimation_pct = 100 * (summary["naive_efd_m"] - summary["efd_m"]) / summary["efd_m"]
-
-# --- Metrics ---
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Horizontal distance", f"{summary['horizontal_distance_m']/1000:.2f} km")
-c2.metric("D+ / D−", f"{summary['d_plus_m']:.0f} m / {summary['d_minus_m']:.0f} m")
-c3.metric("Equivalent Flat Distance", f"{summary['efd_m']/1000:.2f} km")
-c4.metric(
-    "Naive '1000m=10km' estimate",
-    f"{summary['naive_efd_m']/1000:.2f} km",
-    delta=f"{overestimation_pct:+.1f}% vs EFD",
-    delta_color="inverse",
-)
-
 st.divider()
 
-# --- Elevation profile + cost intensity ---
-fig = make_subplots(
-    rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4],
-    vertical_spacing=0.06,
-    subplot_titles=("Elevation profile", "Energy cost per meter along the route"),
-)
-fig.add_trace(
-    go.Scatter(
-        x=segments["distance_km"], y=segments["elevation_m"],
-        mode="lines", fill="tozeroy", name="Elevation",
-        line=dict(color="#6b7280"),
-    ),
-    row=1, col=1,
-)
-fig.add_trace(
-    go.Scatter(
-        x=segments["distance_km"], y=segments["cost_j_per_kg_m"],
-        mode="lines", name="Cost (J/kg/m)",
-        line=dict(color="#dc2626"),
-    ),
-    row=2, col=1,
-)
-fig.add_hline(y=FLAT_COST, line_dash="dot", line_color="gray",
-              annotation_text="flat cost (3.6)", row=2, col=1)
-fig.update_layout(height=550, showlegend=False, margin=dict(t=40, b=10))
-fig.update_xaxes(title_text="Distance (km)", row=2, col=1)
-fig.update_yaxes(title_text="Elevation (m)", row=1, col=1)
-fig.update_yaxes(title_text="J/kg/m", row=2, col=1)
-st.plotly_chart(fig, use_container_width=True)
+# --- File upload & processing settings ---
+with st.sidebar:
+    st.header("Impostazioni")
+    uploaded_files = st.file_uploader(
+        "Carica uno o più file .fit", type=["fit"], accept_multiple_files=True
+    )
+    smooth_window = st.slider("Finestra di smoothing quota (punti)", 1, 31, 9, step=2)
+    resample_step = st.slider("Passo di ricampionamento (m)", 5, 100, 20, step=5)
+    st.caption(
+        "Lo smoothing ripulisce la quota grezza GPS/barometrica prima di calcolare la pendenza. "
+        "Il passo di ricampionamento controlla la risoluzione orizzontale usata per integrare l'energia."
+    )
 
-# --- Cumulative EFD vs naive linear distance ---
-fig2 = go.Figure()
-fig2.add_trace(go.Scatter(
-    x=segments["distance_km"], y=segments["cumulative_efd_km"],
-    mode="lines", name="Cumulative EFD", line=dict(color="#2563eb"),
-))
-fig2.add_trace(go.Scatter(
-    x=segments["distance_km"], y=segments["distance_km"],
-    mode="lines", name="Raw horizontal distance", line=dict(color="#9ca3af", dash="dash"),
-))
-fig2.update_layout(
-    title="Cumulative Equivalent Flat Distance vs. raw distance covered",
-    xaxis_title="Actual distance (km)", yaxis_title="Equivalent flat km",
-    height=350, margin=dict(t=40, b=10),
-)
-st.plotly_chart(fig2, use_container_width=True)
+if not uploaded_files:
+    st.info("Carica uno o più file .fit per iniziare.")
+    st.stop()
 
-# --- Route map colored by cost ---
-st.subheader("Route colored by energy cost")
-fig3 = go.Figure(go.Scattermapbox(
-    lat=segments["lat"], lon=segments["lon"],
-    mode="markers+lines",
-    marker=dict(size=5, color=segments["cost_j_per_kg_m"], colorscale="RdYlGn_r",
-                colorbar=dict(title="J/kg/m")),
-    line=dict(width=2, color="#3b82f6"),
-))
-fig3.update_layout(
-    mapbox=dict(
-        style="open-street-map",
-        center=dict(lat=segments["lat"].mean(), lon=segments["lon"].mean()),
-        zoom=10,
-    ),
-    height=500, margin=dict(t=0, b=0, l=0, r=0),
-)
-st.plotly_chart(fig3, use_container_width=True)
+per_file_zone_tables = []  # list of (filename, zone_table, total_time_s)
 
-# --- Data export ---
-st.divider()
-csv_bytes = segments.to_csv(index=False).encode("utf-8")
-st.download_button(
-    "Download segment data (CSV)",
-    data=csv_bytes,
-    file_name=f"{uploaded.name.rsplit('.', 1)[0]}_efd_segments.csv",
-    mime="text/csv",
-)
+for uploaded in uploaded_files:
+    st.header(f"📄 {uploaded.name}")
 
-with st.expander("Segment data preview"):
-    st.dataframe(segments.head(50), use_container_width=True)
+    df_points = parse_fit(io.BytesIO(uploaded.getvalue()))
+    if len(df_points) < 2:
+        st.error("Traccia non valida: mancano punti GPS/timestamp validi in questo file.")
+        continue
+    if df_points["hr"].isna().all():
+        st.warning("⚠️ Nessun dato di frequenza cardiaca trovato in questo file: impossibile assegnare le zone.")
+        continue
+
+    segments, summary = process_track(df_points, smooth_window, resample_step, zones)
+    if segments is None:
+        st.error("Impossibile calcolare la distanza percorsa (traccia degenere).")
+        continue
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Distanza orizzontale", f"{summary['horizontal_distance_m']/1000:.2f} km")
+    c2.metric("D+ / D−", f"{summary['d_plus_m']:.0f} m / {summary['d_minus_m']:.0f} m")
+    c3.metric("EFD totale", f"{summary['efd_m']/1000:.2f} km")
+
+    st.subheader("EFS media per zona cardiaca")
+    zone_table = zone_efs_table(segments)
+    if zone_table.empty:
+        st.warning("Nessun segmento assegnabile a una zona (dati FC insufficienti).")
+    else:
+        display_table = zone_table.copy()
+        display_table["Tempo (min)"] = display_table["Tempo (min)"].round(0).astype(int)
+        st.dataframe(
+            display_table.style.format({
+                "EFD (km)": "{:.2f}",
+                "EFS media (km/h)": "{:.2f}",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            label="📥 Scarica tabella zone (CSV)",
+            data=zone_table.to_csv(index=False).encode('utf-8'),
+            file_name=f"{uploaded.name.rsplit('.', 1)[0]}_zone_efs.csv",
+            mime='text/csv',
+            key=f"dl_{uploaded.name}",
+        )
+        per_file_zone_tables.append((uploaded.name, zone_table, summary["total_time_s"]))
+
+    with st.expander("Dettaglio segmenti (debug)"):
+        st.dataframe(segments, use_container_width=True)
+
+    st.divider()
+
+# ---------------------------------------------------------------------------
+# Riepilogo finale aggregato su tutti i file
+# ---------------------------------------------------------------------------
+included = [(name, tbl) for name, tbl, total_t in per_file_zone_tables if total_t >= MIN_FILE_DURATION_S]
+excluded = [name for name, tbl, total_t in per_file_zone_tables if total_t < MIN_FILE_DURATION_S]
+
+if included:
+    st.header("📊 Riepilogo finale (media tra i file)")
+    if excluded:
+        st.caption(
+            f"File esclusi dalla media perché più corti di {MIN_FILE_DURATION_S // 60} minuti: "
+            + ", ".join(excluded)
+        )
+
+    all_tables = pd.concat(
+        [tbl.assign(file=name) for name, tbl in included], ignore_index=True
+    )
+
+    summary_rows = []
+    for z in ["Z1", "Z2", "Z3", "Z4", "Z5"]:
+        zdf = all_tables[all_tables["Zona"] == z]
+        if zdf.empty:
+            continue
+        total_time_min = zdf["Tempo (min)"].sum()
+        total_efd_km = zdf["EFD (km)"].sum()
+        # media pesata: EFS = EFD totale / tempo totale (non media delle medie)
+        efs_weighted = (total_efd_km / (total_time_min / 60)) if total_time_min > 0 else np.nan
+        summary_rows.append({
+            "Zona": z,
+            "Tempo totale (min)": int(round(total_time_min)),
+            "EFD totale (km)": total_efd_km,
+            "EFS media (km/h)": efs_weighted,
+            "N. file": len(zdf),
+        })
+
+    final_summary = pd.DataFrame(summary_rows)
+    st.dataframe(
+        final_summary.style.format({
+            "EFD totale (km)": "{:.2f}",
+            "EFS media (km/h)": "{:.2f}",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.download_button(
+        label="📥 Scarica riepilogo finale (CSV)",
+        data=final_summary.to_csv(index=False).encode('utf-8'),
+        file_name="riepilogo_finale_zone_efs.csv",
+        mime='text/csv',
+    )
+elif per_file_zone_tables:
+    st.info(f"Tutti i file caricati sono più corti di {MIN_FILE_DURATION_S // 60} minuti: nessun riepilogo finale calcolato.")

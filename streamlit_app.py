@@ -10,6 +10,10 @@ Carica una o più tracce .fit e calcola, per ciascun segmento:
 In output: velocità media EFS per ogni zona cardiaca, per ciascun file, più un
 riepilogo finale aggregato su tutti i file caricati.
 
+Include inoltre un modulo opzionale di "Lap Analysis" manuale: l'utente
+definisce dei lap (in km) su un file a scelta e ottiene, per ciascun lap,
+distanza, EFD, tempo e velocità equivalente pianeggiante media.
+
 Run with:
     streamlit run streamlit_app.py
 """
@@ -40,6 +44,21 @@ def cost_of_running(slope: np.ndarray) -> np.ndarray:
 
 FLAT_COST = float(cost_of_running(np.array([0.0]))[0])  # 3.6 J/kg/m
 SEMICIRCLE_TO_DEG = 180.0 / (2 ** 31)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def seconds_to_hhmm(seconds) -> str:
+    """Format a duration in seconds as HH:MM:SS (or MM:SS if under an hour)."""
+    if seconds is None or (isinstance(seconds, float) and np.isnan(seconds)):
+        return "-"
+    seconds = int(round(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +218,46 @@ def zone_efs_table(segments: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def compute_lap_result(segments: pd.DataFrame, name: str, start_km: float, end_km: float,
+                        max_distance_km: float, overall_efs_kmh: float) -> dict | None:
+    """
+    Given a segments dataframe (output of process_track) and a [start_km, end_km)
+    range, aggregate EFD and time in that range and return a result row, or None
+    if no data falls in the range.
+
+    Also computes:
+      - % avanzamento: end_km / max_distance_km * 100 (percentuale di avanzamento
+        del file raggiunta alla fine del lap)
+      - scostamento EFS: (EFS lap - EFS media totale del file) / EFS media totale * 100
+    """
+    mask = (segments["distance_km"] > start_km) & (segments["distance_km"] <= end_km)
+    lap_segments = segments.loc[mask]
+    if lap_segments.empty:
+        return None
+
+    lap_time_s = float(lap_segments["dt_s"].sum())
+    lap_efd_km = float(lap_segments["efd_m"].sum()) / 1000
+    lap_efs_kmh = (lap_efd_km / (lap_time_s / 3600)) if lap_time_s > 0 else np.nan
+
+    progress_pct = (end_km / max_distance_km * 100) if max_distance_km > 0 else np.nan
+
+    if not np.isnan(lap_efs_kmh) and overall_efs_kmh and overall_efs_kmh > 0:
+        efs_deviation_pct = (lap_efs_kmh - overall_efs_kmh) / overall_efs_kmh * 100
+    else:
+        efs_deviation_pct = np.nan
+
+    return {
+        "Lap": name,
+        "Distanza (km)": round(end_km - start_km, 2),
+        "% Avanzamento": round(progress_pct, 1) if not np.isnan(progress_pct) else None,
+        "EFD (km)": round(lap_efd_km, 2),
+        "Tempo": seconds_to_hhmm(lap_time_s),
+        "Tempo (s)": round(lap_time_s, 1),
+        "EFS media (km/h)": round(lap_efs_kmh, 2) if not np.isnan(lap_efs_kmh) else None,
+        "Scostamento EFS (%)": round(efs_deviation_pct, 1) if not np.isnan(efs_deviation_pct) else None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -297,6 +356,7 @@ if not uploaded_files:
     st.stop()
 
 per_file_zone_tables = []  # list of (filename, zone_table, total_time_s)
+per_file_segments = {}     # filename -> segments dataframe (needed for Lap Analysis below)
 
 for uploaded in uploaded_files:
     st.header(f"📄 {uploaded.name}")
@@ -313,6 +373,8 @@ for uploaded in uploaded_files:
     if segments is None:
         st.error("Impossibile calcolare la distanza percorsa (traccia degenere).")
         continue
+
+    per_file_segments[uploaded.name] = segments
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Distanza orizzontale", f"{summary['horizontal_distance_m']/1000:.2f} km")
@@ -400,3 +462,166 @@ if included:
     )
 elif per_file_zone_tables:
     st.info(f"Tutti i file caricati sono più corti di {MIN_FILE_DURATION_S // 60} minuti: nessun riepilogo finale calcolato.")
+
+
+# ===========================================================
+# 🏁 LAP ANALYSIS BLOCK (manuale, basato su EFD/EFS)
+# ===========================================================
+st.divider()
+st.header("🏁 Lap Analysis")
+
+do_lap = st.checkbox("Attiva Lap Analysis", value=False, key="do_lap_analysis")
+
+if do_lap:
+    if not per_file_segments:
+        st.warning("Nessun file elaborato correttamente: la Lap Analysis non è disponibile.")
+    else:
+        file_names = list(per_file_segments.keys())
+        target_file = st.selectbox(
+            "Seleziona il file su cui eseguire la Lap Analysis:",
+            file_names,
+            key="lap_target_file",
+        )
+        segments = per_file_segments[target_file]
+        max_distance = round(float(segments["distance_km"].max()), 2)
+
+        st.caption(f"Distanza totale del file selezionato: **{max_distance} km**")
+
+        # --- CSV import (start_km / end_km) ---
+        st.markdown("#### 📥 Importa Lap da CSV")
+        imported_lap_csv = st.file_uploader(
+            "Importa un CSV di lap esportato in precedenza (colonne: name, start_km, end_km):",
+            type=["csv"],
+            key="import_lap_csv",
+        )
+        if imported_lap_csv is not None:
+            try:
+                imported_df = pd.read_csv(imported_lap_csv)
+                required_import_cols = {"name", "start_km", "end_km"}
+                if not required_import_cols.issubset(set(imported_df.columns)):
+                    st.error("⚠️ Il CSV deve contenere le colonne: name, start_km, end_km")
+                else:
+                    imported_df = imported_df[["name", "start_km", "end_km"]].copy()
+                    imported_df["name"] = imported_df["name"].fillna("").astype(str)
+                    st.session_state["manual_lap_table"] = imported_df.reset_index(drop=True)
+                    st.success(f"✅ Importati {len(imported_df)} lap dal CSV!")
+            except Exception as e:
+                st.error(f"⚠️ Errore durante la lettura del CSV: {e}")
+
+        # --- Editable lap table (start_km / end_km only, no chart) ---
+        table_key = "manual_lap_table"
+        if table_key not in st.session_state:
+            st.session_state[table_key] = pd.DataFrame({
+                "name": pd.Series([], dtype="str"),
+                "start_km": pd.Series([], dtype="float"),
+                "end_km": pd.Series([], dtype="float"),
+            })
+
+        st.subheader("Aggiungi / Modifica Lap")
+        st.info(f"Inserisci la distanza di inizio e fine (in km) per ciascun lap (max: {max_distance} km)")
+
+        with st.form("manual_lap_form"):
+            edited = st.data_editor(
+                st.session_state[table_key],
+                num_rows="dynamic",
+                key="manual_lap_editor",
+                column_config={
+                    "name": st.column_config.TextColumn("Nome Lap"),
+                    "start_km": st.column_config.NumberColumn(
+                        "Inizio (km)", min_value=0.0, max_value=float(max_distance), step=0.1, format="%.2f"
+                    ),
+                    "end_km": st.column_config.NumberColumn(
+                        "Fine (km)", min_value=0.0, max_value=float(max_distance), step=0.1, format="%.2f"
+                    ),
+                },
+            )
+            submit_laps = st.form_submit_button("💾 Salva e calcola Lap")
+
+        if submit_laps:
+            edited = edited.reset_index(drop=True)
+
+            # Auto-name any unnamed rows
+            edited["name"] = [
+                row["name"] if pd.notna(row.get("name")) and str(row.get("name", "")).strip() != ""
+                else f"Lap {i+1}"
+                for i, row in edited.iterrows()
+            ]
+
+            # Validation
+            problems = []
+            for i, row in edited.iterrows():
+                if pd.isna(row.get("start_km")):
+                    problems.append(f"Riga {i+1} ({row['name']}): manca l'inizio (km)")
+                if pd.isna(row.get("end_km")):
+                    problems.append(f"Riga {i+1} ({row['name']}): manca la fine (km)")
+                elif not pd.isna(row.get("start_km")) and float(row["end_km"]) <= float(row["start_km"]):
+                    problems.append(f"Riga {i+1} ({row['name']}): la fine deve essere maggiore dell'inizio")
+                elif not pd.isna(row.get("end_km")) and float(row["end_km"]) > max_distance:
+                    problems.append(
+                        f"Riga {i+1} ({row['name']}): la fine ({row['end_km']}) supera la distanza del file ({max_distance} km)"
+                    )
+
+            if problems:
+                for msg in problems:
+                    st.error(f"⚠️ {msg}")
+                st.stop()
+
+            st.session_state[table_key] = edited
+
+            # EFS media dell'intero file selezionato, usata come riferimento per lo scostamento
+            total_efd_km_file = float(segments["efd_m"].sum()) / 1000
+            total_time_s_file = float(segments["dt_s"].sum())
+            overall_efs_kmh = (total_efd_km_file / (total_time_s_file / 3600)) if total_time_s_file > 0 else np.nan
+
+            lap_results = []
+            for i, row in edited.iterrows():
+                res = compute_lap_result(
+                    segments, row["name"], float(row["start_km"]), float(row["end_km"]),
+                    max_distance_km=max_distance, overall_efs_kmh=overall_efs_kmh,
+                )
+                if res is None:
+                    st.warning(f"⚠️ Nessun dato trovato per il lap '{row['name']}' nell'intervallo richiesto.")
+                    continue
+                lap_results.append(res)
+
+            if lap_results:
+                results_df = pd.DataFrame(lap_results).drop(columns=["Tempo (s)"])
+                st.session_state["lap_results_df"] = results_df
+                st.session_state["lap_export_df"] = edited[["name", "start_km", "end_km"]].copy()
+                st.session_state["lap_results_file"] = target_file
+                st.session_state["lap_overall_efs"] = overall_efs_kmh if not np.isnan(overall_efs_kmh) else None
+                st.success(f"✅ {len(lap_results)} lap calcolati!")
+            else:
+                st.session_state["lap_results_df"] = None
+                st.error("⚠️ Nessun lap valido calcolato. Controlla i valori di distanza inseriti.")
+
+        # --- Results table + export ---
+        if st.session_state.get("lap_results_df") is not None:
+            st.subheader("📈 Risultati Lap")
+            if st.session_state.get("lap_overall_efs") is not None:
+                st.caption(f"EFS media dell'intero file (riferimento per lo scostamento): "
+                           f"**{st.session_state['lap_overall_efs']:.2f} km/h**")
+            results_df = st.session_state["lap_results_df"]
+            st.dataframe(results_df, use_container_width=True, hide_index=True)
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                results_csv = results_df.to_csv(index=False).encode("utf-8")
+                safe_name = st.session_state.get("lap_results_file", target_file).rsplit(".", 1)[0]
+                st.download_button(
+                    label="📥 Scarica risultati Lap (CSV)",
+                    data=results_csv,
+                    file_name=f"{safe_name}_lap_results.csv",
+                    mime="text/csv",
+                    key="download_lap_results_csv",
+                )
+            with col_b:
+                if "lap_export_df" in st.session_state:
+                    defs_csv = st.session_state["lap_export_df"].to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        label="📥 Scarica definizione Lap (CSV)",
+                        data=defs_csv,
+                        file_name=f"{safe_name}_lap_definitions.csv",
+                        mime="text/csv",
+                        key="download_lap_defs_csv",
+                    )

@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from fitparse import FitFile
+import xml.etree.ElementTree as ET
 
 st.set_page_config(page_title="FIT — EFD/EFS per zona FC", layout="wide")
 
@@ -353,7 +354,6 @@ with st.sidebar:
 
 if not uploaded_files:
     st.info("Carica uno o più file .fit per iniziare.")
-    st.stop()
 
 per_file_zone_tables = []  # list of (filename, zone_table, total_time_s)
 per_file_segments = {}     # filename -> segments dataframe (needed for Lap Analysis below)
@@ -446,6 +446,7 @@ if included:
         })
 
     final_summary = pd.DataFrame(summary_rows)
+    st.session_state['final_summary_df'] = final_summary
     st.dataframe(
         final_summary.style.format({
             "EFD totale (km)": "{:.2f}",
@@ -625,3 +626,290 @@ if do_lap:
                         mime="text/csv",
                         key="download_lap_defs_csv",
                     )
+
+
+# ---------------------------------------------------------------------------
+# GPX parsing (nessuna dipendenza esterna, solo xml.etree della stdlib)
+# ---------------------------------------------------------------------------
+def parse_gpx(file_obj) -> pd.DataFrame:
+    """Estrae lat, lon, elevazione da un file GPX (percorso gara, no HR/tempo)."""
+    tree = ET.parse(file_obj)
+    root = tree.getroot()
+    ns_uri = root.tag.split('}')[0].strip('{') if root.tag.startswith('{') else ''
+ 
+    def tag(name):
+        return f'{{{ns_uri}}}{name}' if ns_uri else name
+ 
+    rows = []
+    for trkpt in root.iter(tag('trkpt')):
+        lat_attr = trkpt.get('lat')
+        lon_attr = trkpt.get('lon')
+        if lat_attr is None or lon_attr is None:
+            continue
+        ele_el = trkpt.find(tag('ele'))
+        ele = float(ele_el.text) if ele_el is not None and ele_el.text else np.nan
+        rows.append((float(lat_attr), float(lon_attr), ele))
+ 
+    df = pd.DataFrame(rows, columns=["lat", "lon", "ele"])
+    if df.empty:
+        return df
+    df["ele"] = df["ele"].ffill().bfill().fillna(0.0)
+    return df
+ 
+ 
+# ---------------------------------------------------------------------------
+# Calcolo EFD totale di un percorso (nessuna HR/zona richiesta)
+# ---------------------------------------------------------------------------
+def compute_race_efd(df: pd.DataFrame, smooth_window: int, resample_step_m: float):
+    """Calcola EFD totale (m), distanza orizzontale, D+/D- per un percorso gara."""
+    lat, lon, ele = df["lat"].to_numpy(), df["lon"].to_numpy(), df["ele"].to_numpy()
+ 
+    ele_smooth = (pd.Series(ele)
+                  .rolling(window=smooth_window, center=True, min_periods=1)
+                  .mean()
+                  .to_numpy())
+ 
+    seg_dist = haversine_vec(lat[:-1], lon[:-1], lat[1:], lon[1:])
+    cum_dist = np.concatenate([[0.0], np.cumsum(seg_dist)])
+    total_dist = cum_dist[-1]
+    if total_dist <= 0:
+        return None
+ 
+    n_steps = max(2, int(total_dist // resample_step_m))
+    grid = np.linspace(0.0, total_dist, n_steps)
+    ele_grid = np.interp(grid, cum_dist, ele_smooth)
+ 
+    dx = np.diff(grid)
+    dz = np.diff(ele_grid)
+    dist3d = np.hypot(dx, dz)
+    slope = np.divide(dz, dx, out=np.zeros_like(dz), where=dx > 0)
+ 
+    cost = cost_of_running(slope)
+    energy = cost * dist3d
+    efd_m = energy / FLAT_COST
+ 
+    d_plus = float(dz[dz > 0].sum())
+    d_minus = float(-dz[dz < 0].sum())
+ 
+    return {
+        "horizontal_distance_m": total_dist,
+        "d_plus_m": d_plus,
+        "d_minus_m": d_minus,
+        "efd_m": float(efd_m.sum()),
+    }
+ 
+ 
+# ===========================================================
+# UI — Previsione Tempo Gara
+# ===========================================================
+st.divider()
+st.header("🎯 Previsione Tempo Gara")
+ 
+# --- 1. Percorso gara --------------------------------------------------
+st.subheader("1️⃣ Percorso gara (GPX o FIT)")
+race_files = st.file_uploader(
+    "Carica uno o più file del percorso gara (.gpx o .fit)",
+    type=["gpx", "fit"],
+    accept_multiple_files=True,
+    key="race_course_files",
+)
+ 
+if race_files:
+    race_names = [f.name for f in race_files]
+    selected_race_name = st.selectbox(
+        "Seleziona il file gara da usare per la previsione:",
+        race_names,
+        key="selected_race_file",
+    )
+    selected_race_file = next(f for f in race_files if f.name == selected_race_name)
+    ext = selected_race_file.name.rsplit(".", 1)[-1].lower()
+ 
+    try:
+        if ext == "gpx":
+            df_race = parse_gpx(io.BytesIO(selected_race_file.getvalue()))
+        else:
+            df_race_full = parse_fit(io.BytesIO(selected_race_file.getvalue()))
+            df_race = df_race_full[["lat", "lon", "ele"]] if not df_race_full.empty else df_race_full
+ 
+        if df_race is None or len(df_race) < 2:
+            st.error("⚠️ Traccia gara non valida: mancano punti GPS sufficienti.")
+        else:
+            race_summary = compute_race_efd(df_race, smooth_window, resample_step)
+            if race_summary is None:
+                st.error("⚠️ Impossibile calcolare l'EFD per questo percorso (traccia degenere).")
+            else:
+                st.session_state["race_efd_m"] = race_summary["efd_m"]
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Distanza orizzontale", f"{race_summary['horizontal_distance_m']/1000:.2f} km")
+                c2.metric("D+ / D−", f"{race_summary['d_plus_m']:.0f} m / {race_summary['d_minus_m']:.0f} m")
+                c3.metric("EFD totale gara", f"{race_summary['efd_m']/1000:.2f} km")
+    except Exception as e:
+        st.error(f"⚠️ Errore durante la lettura del file gara: {e}")
+ 
+race_efd_m = st.session_state.get("race_efd_m")
+ 
+st.divider()
+ 
+# --- 2. Dati EFS di riferimento -----------------------------------------
+st.subheader("2️⃣ Dati EFS di riferimento (allenamento)")
+ 
+efs_source = st.radio(
+    "Fonte EFS per zona:",
+    ["Usa il riepilogo calcolato in questa sessione", "Importa CSV riepilogo EFS"],
+    key="efs_source_race",
+)
+ 
+zone_efs_ref = {}
+ 
+if efs_source == "Usa il riepilogo calcolato in questa sessione":
+    final_summary_df = st.session_state.get("final_summary_df")
+    if final_summary_df is not None and not final_summary_df.empty:
+        for _, row in final_summary_df.iterrows():
+            zone_efs_ref[row["Zona"]] = float(row["EFS media (km/h)"])
+        st.success(
+            "✅ EFS di riferimento: " +
+            ", ".join(f"{z} = {v:.2f} km/h" for z, v in zone_efs_ref.items())
+        )
+    else:
+        st.warning(
+            "⚠️ Nessun riepilogo finale disponibile in questa sessione: carica dei file .fit "
+            "più in alto nella pagina, oppure importa un CSV."
+        )
+else:
+    uploaded_efs_csv = st.file_uploader(
+        "Carica CSV riepilogo EFS per zona (colonne: Zona, EFS media (km/h))",
+        type=["csv"],
+        key="efs_ref_csv",
+    )
+    if uploaded_efs_csv is not None:
+        try:
+            ref_df = pd.read_csv(uploaded_efs_csv)
+            zona_col = next((c for c in ref_df.columns if c.strip().lower() == "zona"), None)
+            efs_col = next((c for c in ref_df.columns if "efs" in c.lower()), None)
+            if zona_col is None or efs_col is None:
+                st.error(
+                    "⚠️ Il CSV deve contenere una colonna 'Zona' e una colonna EFS "
+                    "(es. 'EFS media (km/h)')."
+                )
+            else:
+                for _, row in ref_df.iterrows():
+                    zone_efs_ref[row[zona_col]] = float(row[efs_col])
+                st.success(
+                    "✅ EFS di riferimento importate: " +
+                    ", ".join(f"{z} = {v:.2f} km/h" for z, v in zone_efs_ref.items())
+                )
+        except Exception as e:
+            st.error(f"⚠️ Errore durante la lettura del CSV: {e}")
+ 
+st.divider()
+ 
+# --- 3. Vincoli orari per zona -------------------------------------------
+st.subheader("3️⃣ Vincoli orari per zona (Z2 - Z5)")
+ 
+preset = st.radio(
+    "Profilo di gara:",
+    ["Conservativo", "Coraggioso", "Competitivo", "Personalizzato"],
+    horizontal=True,
+    key="race_profile_preset",
+)
+ 
+PRESET_VALUES = {
+    "Conservativo": {"race_t_z2": 0.0, "race_t_z3": 0.0, "race_t_z4": 0.0, "race_t_z5": 0.0},
+    "Coraggioso":   {"race_t_z2": 3.0, "race_t_z3": 0.0, "race_t_z4": 0.0, "race_t_z5": 0.0},
+    "Competitivo":  {"race_t_z2": 6.0, "race_t_z3": 1.5, "race_t_z4": 0.0, "race_t_z5": 0.0},
+}
+ 
+# Applica i valori preset SOLO quando il profilo cambia, così l'utente può
+# comunque modificare gli slider liberamente dopo la selezione (anche in
+# "Personalizzato", dove semplicemente non si sovrascrive nulla).
+if st.session_state.get("_last_race_preset") != preset:
+    if preset in PRESET_VALUES:
+        st.session_state.update(PRESET_VALUES[preset])
+    st.session_state["_last_race_preset"] = preset
+ 
+if preset == "Conservativo":
+    st.info("ℹ️ L'atleta correrà unicamente in Zona 1")
+ 
+col1, col2, col3, col4 = st.columns(4)
+t_z2 = col1.slider("Ore in Zona 2", min_value=0.0, max_value=15.0, step=0.25, key="race_t_z2")
+t_z3 = col2.slider("Ore in Zona 3", min_value=0.0, max_value=15.0, step=0.25, key="race_t_z3")
+t_z4 = col3.slider("Ore in Zona 4", min_value=0.0, max_value=15.0, step=0.25, key="race_t_z4")
+t_z5 = col4.slider("Ore in Zona 5", min_value=0.0, max_value=15.0, step=0.25, key="race_t_z5")
+ 
+st.divider()
+ 
+# --- 4. Calcolo previsione -----------------------------------------------
+st.subheader("4️⃣ Previsione tempo gara")
+ 
+if st.button("🎯 Calcola previsione", key="compute_race_time"):
+    if race_efd_m is None:
+        st.error("⚠️ Carica prima un file gara valido (sezione 1).")
+    elif not zone_efs_ref:
+        st.error("⚠️ Nessun dato EFS di riferimento disponibile (sezione 2).")
+    else:
+        total_efd_km = race_efd_m / 1000
+        zone_times_h = {"Z5": t_z5, "Z4": t_z4, "Z3": t_z3, "Z2": t_z2}
+ 
+        remaining_efd_km = total_efd_km
+        capped = False
+        capped_zone = None
+        breakdown = []
+        missing_efs = False
+ 
+        # Si procede dalla zona più alta (Z5) alla più bassa (Z2), sottraendo
+        # via via l'EFD "consumata" da ciascun vincolo orario. Se in un
+        # qualunque momento l'EFD residua andrebbe sotto zero, si tronca
+        # quella zona a ciò che resta e ci si ferma (le zone successive
+        # -incluse eventuali zone più basse e la Zona 1- non ricevono EFD).
+        for zname in ["Z5", "Z4", "Z3", "Z2"]:
+            t_h = zone_times_h[zname]
+            efs = zone_efs_ref.get(zname)
+ 
+            if t_h > 0 and (efs is None or efs <= 0):
+                st.error(f"⚠️ Manca l'EFS di riferimento per la {zname}: impossibile calcolare.")
+                missing_efs = True
+                break
+ 
+            contrib_km = t_h * (efs or 0.0)
+ 
+            if remaining_efd_km - contrib_km <= 0:
+                breakdown.append({
+                    "Zona": zname, "Tempo (h)": t_h,
+                    "EFD coperta (km)": round(remaining_efd_km, 2),
+                })
+                remaining_efd_km = 0.0
+                capped = True
+                capped_zone = zname
+                break
+            else:
+                breakdown.append({
+                    "Zona": zname, "Tempo (h)": t_h,
+                    "EFD coperta (km)": round(contrib_km, 2),
+                })
+                remaining_efd_km -= contrib_km
+ 
+        if not missing_efs:
+            efs_z1 = zone_efs_ref.get("Z1")
+            if efs_z1 is None or efs_z1 <= 0:
+                st.error("⚠️ Manca l'EFS di riferimento per la Zona 1: impossibile calcolare il tempo restante.")
+            else:
+                time_z1_h = (remaining_efd_km / efs_z1) if remaining_efd_km > 0 else 0.0
+                race_time_h = time_z1_h + t_z2 + t_z3 + t_z4 + t_z5
+ 
+                st.metric("⏱️ Tempo di gara previsto", seconds_to_hhmm(race_time_h * 3600))
+ 
+                if capped:
+                    st.warning(
+                        f"⚠️ I vincoli orari inseriti richiedono più EFD di quanta ne offra il percorso "
+                        f"gara: la {capped_zone} è stata troncata e la Zona 1 non contribuisce "
+                        f"(tempo = 0h). Il profilo scelto non è sostenibile su questa distanza."
+                    )
+ 
+                with st.expander("Dettaglio calcolo"):
+                    st.write(f"EFD totale gara: **{total_efd_km:.2f} km**")
+                    st.dataframe(
+                        pd.DataFrame(breakdown), use_container_width=True, hide_index=True
+                    )
+                    st.write(f"EFD residua per Zona 1: **{remaining_efd_km:.2f} km**")
+                    st.write(f"Tempo in Zona 1: **{seconds_to_hhmm(time_z1_h * 3600)}**")
+                    st.write(f"EFS Zona 1 usata: **{efs_z1:.2f} km/h**")

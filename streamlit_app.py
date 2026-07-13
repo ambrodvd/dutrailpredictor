@@ -218,53 +218,13 @@ def zone_efs_table(segments: pd.DataFrame) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
-
-def compute_lap_result(segments: pd.DataFrame, name: str, start_km: float, end_km: float,
-                        max_distance_km: float, overall_efs_kmh: float) -> dict | None:
-    """
-    Given a segments dataframe (output of process_track) and a [start_km, end_km)
-    range, aggregate EFD and time in that range and return a result row, or None
-    if no data falls in the range.
-
-    Also computes:
-      - % avanzamento: end_km / max_distance_km * 100 (percentuale di avanzamento
-        del file raggiunta alla fine del lap)
-      - scostamento EFS: (EFS lap - EFS media totale del file) / EFS media totale * 100
-    """
-    mask = (segments["distance_km"] > start_km) & (segments["distance_km"] <= end_km)
-    lap_segments = segments.loc[mask]
-    if lap_segments.empty:
-        return None
-
-    lap_time_s = float(lap_segments["dt_s"].sum())
-    lap_efd_km = float(lap_segments["efd_m"].sum()) / 1000
-    lap_efs_kmh = (lap_efd_km / (lap_time_s / 3600)) if lap_time_s > 0 else np.nan
-
-    progress_pct = (end_km / max_distance_km * 100) if max_distance_km > 0 else np.nan
-
-    if not np.isnan(lap_efs_kmh) and overall_efs_kmh and overall_efs_kmh > 0:
-        efs_deviation_pct = (lap_efs_kmh - overall_efs_kmh) / overall_efs_kmh * 100
-    else:
-        efs_deviation_pct = np.nan
-
-    return {
-        "Lap": name,
-        "Distanza (km)": round(end_km - start_km, 2),
-        "% Avanzamento": round(progress_pct, 1) if not np.isnan(progress_pct) else None,
-        "EFD (km)": round(lap_efd_km, 2),
-        "Tempo": seconds_to_hhmm(lap_time_s),
-        "Tempo (s)": round(lap_time_s, 1),
-        "EFS media (km/h)": round(lap_efs_kmh, 2) if not np.isnan(lap_efs_kmh) else None,
-        "Scostamento EFS (%)": round(efs_deviation_pct, 1) if not np.isnan(efs_deviation_pct) else None,
-    }
-
-
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
-st.title("🏃‍♂️ FIT — Equivalent Flat Speed per zona cardiaca")
+st.title("🏃‍♂️ DU Trail race predictor")
 st.caption(
-    "Analisi bioenergetica basata su Minetti et al. (2002): per ogni segmento calcola "
+    "La previsione di gara si basa sull'analisi degli allenamenti e delle gare di avvicinamento effettuate dall'atleta." \
+    "L'analisi è basata sullo studio bioenergentico di Minetti et al. (2002): per ogni segmento calcola "
     "distanza equivalente pianeggiante (EFD), tempo, velocità equivalente pianeggiante "
     "(EFS) e zona cardiaca prevalente."
 )
@@ -275,7 +235,9 @@ for zone, val in default_zones.items():
     if zone not in st.session_state:
         st.session_state[zone] = val
 
-st.subheader("❤️ Zone cardiache dell'atleta")
+st.subheader("Per l'analisi degli allenamenti carica i file .fit a sinistra e inserisci le zone cardiache dell'atleta")
+
+st.markdown(':red[Imposta le zone cardiache per una corretta analisi degli allenamenti:]')
 
 input_method = st.radio("Metodo di input:", ["Manuale", "Importa CSV"], horizontal=True)
 
@@ -351,9 +313,6 @@ with st.sidebar:
         "Lo smoothing ripulisce la quota grezza GPS/barometrica prima di calcolare la pendenza. "
         "Il passo di ricampionamento controlla la risoluzione orizzontale usata per integrare l'energia."
     )
-
-if not uploaded_files:
-    st.info("Carica uno o più file .fit per iniziare.")
 
 per_file_zone_tables = []  # list of (filename, zone_table, total_time_s)
 per_file_segments = {}     # filename -> segments dataframe (needed for Lap Analysis below)
@@ -464,170 +423,6 @@ if included:
 elif per_file_zone_tables:
     st.info(f"Tutti i file caricati sono più corti di {MIN_FILE_DURATION_S // 60} minuti: nessun riepilogo finale calcolato.")
 
-
-# ===========================================================
-# 🏁 LAP ANALYSIS BLOCK (manuale, basato su EFD/EFS)
-# ===========================================================
-st.divider()
-st.header("🏁 Lap Analysis")
-
-do_lap = st.checkbox("Attiva Lap Analysis", value=False, key="do_lap_analysis")
-
-if do_lap:
-    if not per_file_segments:
-        st.warning("Nessun file elaborato correttamente: la Lap Analysis non è disponibile.")
-    else:
-        file_names = list(per_file_segments.keys())
-        target_file = st.selectbox(
-            "Seleziona il file su cui eseguire la Lap Analysis:",
-            file_names,
-            key="lap_target_file",
-        )
-        segments = per_file_segments[target_file]
-        max_distance = round(float(segments["distance_km"].max()), 2)
-
-        st.caption(f"Distanza totale del file selezionato: **{max_distance} km**")
-
-        # --- CSV import (start_km / end_km) ---
-        st.markdown("#### 📥 Importa Lap da CSV")
-        imported_lap_csv = st.file_uploader(
-            "Importa un CSV di lap esportato in precedenza (colonne: name, start_km, end_km):",
-            type=["csv"],
-            key="import_lap_csv",
-        )
-        if imported_lap_csv is not None:
-            try:
-                imported_df = pd.read_csv(imported_lap_csv)
-                required_import_cols = {"name", "start_km", "end_km"}
-                if not required_import_cols.issubset(set(imported_df.columns)):
-                    st.error("⚠️ Il CSV deve contenere le colonne: name, start_km, end_km")
-                else:
-                    imported_df = imported_df[["name", "start_km", "end_km"]].copy()
-                    imported_df["name"] = imported_df["name"].fillna("").astype(str)
-                    st.session_state["manual_lap_table"] = imported_df.reset_index(drop=True)
-                    st.success(f"✅ Importati {len(imported_df)} lap dal CSV!")
-            except Exception as e:
-                st.error(f"⚠️ Errore durante la lettura del CSV: {e}")
-
-        # --- Editable lap table (start_km / end_km only, no chart) ---
-        table_key = "manual_lap_table"
-        if table_key not in st.session_state:
-            st.session_state[table_key] = pd.DataFrame({
-                "name": pd.Series([], dtype="str"),
-                "start_km": pd.Series([], dtype="float"),
-                "end_km": pd.Series([], dtype="float"),
-            })
-
-        st.subheader("Aggiungi / Modifica Lap")
-        st.info(f"Inserisci la distanza di inizio e fine (in km) per ciascun lap (max: {max_distance} km)")
-
-        with st.form("manual_lap_form"):
-            edited = st.data_editor(
-                st.session_state[table_key],
-                num_rows="dynamic",
-                key="manual_lap_editor",
-                column_config={
-                    "name": st.column_config.TextColumn("Nome Lap"),
-                    "start_km": st.column_config.NumberColumn(
-                        "Inizio (km)", min_value=0.0, max_value=float(max_distance), step=0.1, format="%.2f"
-                    ),
-                    "end_km": st.column_config.NumberColumn(
-                        "Fine (km)", min_value=0.0, max_value=float(max_distance), step=0.1, format="%.2f"
-                    ),
-                },
-            )
-            submit_laps = st.form_submit_button("💾 Salva e calcola Lap")
-
-        if submit_laps:
-            edited = edited.reset_index(drop=True)
-
-            # Auto-name any unnamed rows
-            edited["name"] = [
-                row["name"] if pd.notna(row.get("name")) and str(row.get("name", "")).strip() != ""
-                else f"Lap {i+1}"
-                for i, row in edited.iterrows()
-            ]
-
-            # Validation
-            problems = []
-            for i, row in edited.iterrows():
-                if pd.isna(row.get("start_km")):
-                    problems.append(f"Riga {i+1} ({row['name']}): manca l'inizio (km)")
-                if pd.isna(row.get("end_km")):
-                    problems.append(f"Riga {i+1} ({row['name']}): manca la fine (km)")
-                elif not pd.isna(row.get("start_km")) and float(row["end_km"]) <= float(row["start_km"]):
-                    problems.append(f"Riga {i+1} ({row['name']}): la fine deve essere maggiore dell'inizio")
-                elif not pd.isna(row.get("end_km")) and float(row["end_km"]) > max_distance:
-                    problems.append(
-                        f"Riga {i+1} ({row['name']}): la fine ({row['end_km']}) supera la distanza del file ({max_distance} km)"
-                    )
-
-            if problems:
-                for msg in problems:
-                    st.error(f"⚠️ {msg}")
-                st.stop()
-
-            st.session_state[table_key] = edited
-
-            # EFS media dell'intero file selezionato, usata come riferimento per lo scostamento
-            total_efd_km_file = float(segments["efd_m"].sum()) / 1000
-            total_time_s_file = float(segments["dt_s"].sum())
-            overall_efs_kmh = (total_efd_km_file / (total_time_s_file / 3600)) if total_time_s_file > 0 else np.nan
-
-            lap_results = []
-            for i, row in edited.iterrows():
-                res = compute_lap_result(
-                    segments, row["name"], float(row["start_km"]), float(row["end_km"]),
-                    max_distance_km=max_distance, overall_efs_kmh=overall_efs_kmh,
-                )
-                if res is None:
-                    st.warning(f"⚠️ Nessun dato trovato per il lap '{row['name']}' nell'intervallo richiesto.")
-                    continue
-                lap_results.append(res)
-
-            if lap_results:
-                results_df = pd.DataFrame(lap_results).drop(columns=["Tempo (s)"])
-                st.session_state["lap_results_df"] = results_df
-                st.session_state["lap_export_df"] = edited[["name", "start_km", "end_km"]].copy()
-                st.session_state["lap_results_file"] = target_file
-                st.session_state["lap_overall_efs"] = overall_efs_kmh if not np.isnan(overall_efs_kmh) else None
-                st.success(f"✅ {len(lap_results)} lap calcolati!")
-            else:
-                st.session_state["lap_results_df"] = None
-                st.error("⚠️ Nessun lap valido calcolato. Controlla i valori di distanza inseriti.")
-
-        # --- Results table + export ---
-        if st.session_state.get("lap_results_df") is not None:
-            st.subheader("📈 Risultati Lap")
-            if st.session_state.get("lap_overall_efs") is not None:
-                st.caption(f"EFS media dell'intero file (riferimento per lo scostamento): "
-                           f"**{st.session_state['lap_overall_efs']:.2f} km/h**")
-            results_df = st.session_state["lap_results_df"]
-            st.dataframe(results_df, use_container_width=True, hide_index=True)
-
-            col_a, col_b = st.columns(2)
-            with col_a:
-                results_csv = results_df.to_csv(index=False).encode("utf-8")
-                safe_name = st.session_state.get("lap_results_file", target_file).rsplit(".", 1)[0]
-                st.download_button(
-                    label="📥 Scarica risultati Lap (CSV)",
-                    data=results_csv,
-                    file_name=f"{safe_name}_lap_results.csv",
-                    mime="text/csv",
-                    key="download_lap_results_csv",
-                )
-            with col_b:
-                if "lap_export_df" in st.session_state:
-                    defs_csv = st.session_state["lap_export_df"].to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        label="📥 Scarica definizione Lap (CSV)",
-                        data=defs_csv,
-                        file_name=f"{safe_name}_lap_definitions.csv",
-                        mime="text/csv",
-                        key="download_lap_defs_csv",
-                    )
-
-
 # ---------------------------------------------------------------------------
 # GPX parsing (nessuna dipendenza esterna, solo xml.etree della stdlib)
 # ---------------------------------------------------------------------------
@@ -704,7 +499,7 @@ def compute_race_efd(df: pd.DataFrame, smooth_window: int, resample_step_m: floa
 # ===========================================================
 st.divider()
 st.header("🎯 Previsione Tempo Gara")
- 
+
 # --- 1. Percorso gara --------------------------------------------------
 st.subheader("1️⃣ Percorso gara (GPX o FIT)")
 race_files = st.file_uploader(
@@ -713,7 +508,7 @@ race_files = st.file_uploader(
     accept_multiple_files=True,
     key="race_course_files",
 )
- 
+
 if race_files:
     race_names = [f.name for f in race_files]
     selected_race_name = st.selectbox(
@@ -723,14 +518,14 @@ if race_files:
     )
     selected_race_file = next(f for f in race_files if f.name == selected_race_name)
     ext = selected_race_file.name.rsplit(".", 1)[-1].lower()
- 
+
     try:
         if ext == "gpx":
             df_race = parse_gpx(io.BytesIO(selected_race_file.getvalue()))
         else:
             df_race_full = parse_fit(io.BytesIO(selected_race_file.getvalue()))
             df_race = df_race_full[["lat", "lon", "ele"]] if not df_race_full.empty else df_race_full
- 
+
         if df_race is None or len(df_race) < 2:
             st.error("⚠️ Traccia gara non valida: mancano punti GPS sufficienti.")
         else:
@@ -745,22 +540,22 @@ if race_files:
                 c3.metric("EFD totale gara", f"{race_summary['efd_m']/1000:.2f} km")
     except Exception as e:
         st.error(f"⚠️ Errore durante la lettura del file gara: {e}")
- 
+
 race_efd_m = st.session_state.get("race_efd_m")
- 
+
 st.divider()
- 
+
 # --- 2. Dati EFS di riferimento -----------------------------------------
 st.subheader("2️⃣ Dati EFS di riferimento (allenamento)")
- 
+
 efs_source = st.radio(
     "Fonte EFS per zona:",
     ["Usa il riepilogo calcolato in questa sessione", "Importa CSV riepilogo EFS"],
     key="efs_source_race",
 )
- 
+
 zone_efs_ref = {}
- 
+
 if efs_source == "Usa il riepilogo calcolato in questa sessione":
     final_summary_df = st.session_state.get("final_summary_df")
     if final_summary_df is not None and not final_summary_df.empty:
@@ -800,116 +595,207 @@ else:
                 )
         except Exception as e:
             st.error(f"⚠️ Errore durante la lettura del CSV: {e}")
- 
+
 st.divider()
- 
+
 # --- 3. Vincoli orari per zona -------------------------------------------
 st.subheader("3️⃣ Vincoli orari per zona (Z2 - Z5)")
- 
-preset = st.radio(
-    "Profilo di gara:",
-    ["Conservativo", "Coraggioso", "Competitivo", "Personalizzato"],
-    horizontal=True,
-    key="race_profile_preset",
-)
- 
+
 PRESET_VALUES = {
-    "Conservativo": {"race_t_z2": 0.0, "race_t_z3": 0.0, "race_t_z4": 0.0, "race_t_z5": 0.0},
-    "Coraggioso":   {"race_t_z2": 3.0, "race_t_z3": 0.0, "race_t_z4": 0.0, "race_t_z5": 0.0},
-    "Competitivo":  {"race_t_z2": 6.0, "race_t_z3": 1.5, "race_t_z4": 0.0, "race_t_z5": 0.0},
+    "Cauto":        {"t_z2": 0.0, "t_z3": 0.0, "t_z4": 0.0, "t_z5": 0.0},
+    "Conservativo": {"t_z2": 0.0, "t_z3": 0.0, "t_z4": 0.0, "t_z5": 0.0},
+    "Coraggioso":   {"t_z2": 3.0, "t_z3": 0.0, "t_z4": 0.0, "t_z5": 0.0},
+    "Competitivo":  {"t_z2": 6.0, "t_z3": 1.5, "t_z4": 0.0, "t_z5": 0.0},
 }
- 
-# Applica i valori preset SOLO quando il profilo cambia, così l'utente può
-# comunque modificare gli slider liberamente dopo la selezione (anche in
-# "Personalizzato", dove semplicemente non si sovrascrive nulla).
-if st.session_state.get("_last_race_preset") != preset:
-    if preset in PRESET_VALUES:
-        st.session_state.update(PRESET_VALUES[preset])
-    st.session_state["_last_race_preset"] = preset
- 
-if preset == "Conservativo":
-    st.info("ℹ️ L'atleta correrà unicamente in Zona 1")
- 
-col1, col2, col3, col4 = st.columns(4)
-t_z2 = col1.slider("Ore in Zona 2", min_value=0.0, max_value=15.0, step=0.25, key="race_t_z2")
-t_z3 = col2.slider("Ore in Zona 3", min_value=0.0, max_value=15.0, step=0.25, key="race_t_z3")
-t_z4 = col3.slider("Ore in Zona 4", min_value=0.0, max_value=15.0, step=0.25, key="race_t_z4")
-t_z5 = col4.slider("Ore in Zona 5", min_value=0.0, max_value=15.0, step=0.25, key="race_t_z5")
- 
+
+CAUTO_Z1_FACTOR = 0.9  # EFS Zona 1 ridotta del 10% quando il profilo è "Cauto"
+
+
+def render_profile_selector(key_prefix: str, title: str | None = None):
+    """
+    Disegna il selettore di profilo + slider per un singolo profilo di gara.
+    key_prefix distingue i session_state key (es. "race", "race_a", "race_b")
+    così più profili possono coesistere in pagina senza sovrascriversi.
+    Ritorna: t_z2, t_z3, t_z4, t_z5, use_cauto, preset
+    """
+    if title:
+        st.markdown(f"**{title}**")
+
+    preset = st.radio(
+        "Profilo di gara:",
+        ["Cauto", "Conservativo", "Coraggioso", "Competitivo", "Personalizzato"],
+        horizontal=True,
+        key=f"{key_prefix}_profile_preset",
+    )
+
+    # Applica i valori preset SOLO quando il profilo cambia, così l'utente può
+    # comunque modificare gli slider liberamente dopo la selezione (anche in
+    # "Personalizzato", dove semplicemente non si sovrascrive nulla).
+    last_preset_key = f"_last_{key_prefix}_preset"
+    if st.session_state.get(last_preset_key) != preset:
+        if preset in PRESET_VALUES:
+            st.session_state[f"{key_prefix}_t_z2"] = PRESET_VALUES[preset]["t_z2"]
+            st.session_state[f"{key_prefix}_t_z3"] = PRESET_VALUES[preset]["t_z3"]
+            st.session_state[f"{key_prefix}_t_z4"] = PRESET_VALUES[preset]["t_z4"]
+            st.session_state[f"{key_prefix}_t_z5"] = PRESET_VALUES[preset]["t_z5"]
+        st.session_state[last_preset_key] = preset
+
+    if preset == "Conservativo":
+        st.info("ℹ️ L'atleta correrà unicamente in Zona 1")
+    elif preset == "Cauto":
+        st.info(
+            "ℹ️ L'atleta correrà unicamente in Zona 1, con EFS Zona 1 ridotta del "
+            f"{int((1 - CAUTO_Z1_FACTOR) * 100)}% per margine di sicurezza"
+        )
+
+    col1, col2, col3, col4 = st.columns(4)
+    t_z2 = col1.slider("Ore in Zona 2", min_value=0.0, max_value=15.0, step=0.25, key=f"{key_prefix}_t_z2")
+    t_z3 = col2.slider("Ore in Zona 3", min_value=0.0, max_value=15.0, step=0.25, key=f"{key_prefix}_t_z3")
+    t_z4 = col3.slider("Ore in Zona 4", min_value=0.0, max_value=15.0, step=0.25, key=f"{key_prefix}_t_z4")
+    t_z5 = col4.slider("Ore in Zona 5", min_value=0.0, max_value=15.0, step=0.25, key=f"{key_prefix}_t_z5")
+
+    use_cauto = (preset == "Cauto")
+    return t_z2, t_z3, t_z4, t_z5, use_cauto, preset
+
+
+compare_mode = st.checkbox("🔀 Confronta due profili (calcola un range)", key="race_compare_mode")
+
+if not compare_mode:
+    t_z2, t_z3, t_z4, t_z5, use_cauto, preset = render_profile_selector("race")
+else:
+    col_a, col_b = st.columns(2)
+    with col_a:
+        t_z2_a, t_z3_a, t_z4_a, t_z5_a, use_cauto_a, preset_a = render_profile_selector("race_a", "Profilo A")
+    with col_b:
+        t_z2_b, t_z3_b, t_z4_b, t_z5_b, use_cauto_b, preset_b = render_profile_selector("race_b", "Profilo B")
+
 st.divider()
- 
+
 # --- 4. Calcolo previsione -----------------------------------------------
 st.subheader("4️⃣ Previsione tempo gara")
- 
+
+
+def compute_race_time(t_z2, t_z3, t_z4, t_z5, zone_efs_ref, race_efd_m, use_cauto):
+    """
+    Calcola il tempo di gara previsto per un singolo profilo (vincoli orari
+    per zona + EFS di riferimento). Se use_cauto=True, l'EFS di Zona 1 usata
+    per il tempo residuo viene ridotta di CAUTO_Z1_FACTOR.
+    Ritorna un dict con "error" (None se ok) e i dettagli del calcolo.
+    """
+    total_efd_km = race_efd_m / 1000
+    zone_times_h = {"Z5": t_z5, "Z4": t_z4, "Z3": t_z3, "Z2": t_z2}
+
+    remaining_efd_km = total_efd_km
+    capped = False
+    capped_zone = None
+    breakdown = []
+
+    # Si procede dalla zona più alta (Z5) alla più bassa (Z2), sottraendo
+    # via via l'EFD "consumata" da ciascun vincolo orario. Se in un
+    # qualunque momento l'EFD residua andrebbe sotto zero, si tronca
+    # quella zona a ciò che resta e ci si ferma (le zone successive
+    # -incluse eventuali zone più basse e la Zona 1- non ricevono EFD).
+    for zname in ["Z5", "Z4", "Z3", "Z2"]:
+        t_h = zone_times_h[zname]
+        efs = zone_efs_ref.get(zname)
+
+        if t_h > 0 and (efs is None or efs <= 0):
+            return {"error": f"Manca l'EFS di riferimento per la {zname}: impossibile calcolare."}
+
+        contrib_km = t_h * (efs or 0.0)
+
+        if remaining_efd_km - contrib_km <= 0:
+            breakdown.append({
+                "Zona": zname, "Tempo (h)": t_h,
+                "EFD coperta (km)": round(remaining_efd_km, 2),
+            })
+            remaining_efd_km = 0.0
+            capped = True
+            capped_zone = zname
+            break
+        else:
+            breakdown.append({
+                "Zona": zname, "Tempo (h)": t_h,
+                "EFD coperta (km)": round(contrib_km, 2),
+            })
+            remaining_efd_km -= contrib_km
+
+    efs_z1 = zone_efs_ref.get("Z1")
+    if efs_z1 is None or efs_z1 <= 0:
+        return {"error": "Manca l'EFS di riferimento per la Zona 1: impossibile calcolare il tempo restante."}
+
+    efs_z1_used = efs_z1 * CAUTO_Z1_FACTOR if use_cauto else efs_z1
+
+    time_z1_h = (remaining_efd_km / efs_z1_used) if remaining_efd_km > 0 else 0.0
+    race_time_h = time_z1_h + t_z2 + t_z3 + t_z4 + t_z5
+
+    return {
+        "error": None,
+        "race_time_h": race_time_h,
+        "capped": capped,
+        "capped_zone": capped_zone,
+        "breakdown": breakdown,
+        "remaining_efd_km": remaining_efd_km,
+        "time_z1_h": time_z1_h,
+        "efs_z1_used": efs_z1_used,
+        "total_efd_km": total_efd_km,
+    }
+
+
+def display_result(result, label: str | None = None):
+    suffix = f" — {label}" if label else ""
+    st.metric(f"⏱️ Tempo di gara previsto{suffix}", seconds_to_hhmm(result["race_time_h"] * 3600))
+
+    if result["capped"]:
+        st.warning(
+            f"⚠️ I vincoli orari inseriti richiedono più EFD di quanta ne offra il percorso "
+            f"gara: la {result['capped_zone']} è stata troncata e la Zona 1 non contribuisce "
+            f"(tempo = 0h). Il profilo scelto non è sostenibile su questa distanza."
+        )
+
+    with st.expander(f"Dettaglio calcolo{suffix}"):
+        st.write(f"EFD totale gara: **{result['total_efd_km']:.2f} km**")
+        st.dataframe(
+            pd.DataFrame(result["breakdown"]), use_container_width=True, hide_index=True
+        )
+        st.write(f"EFD residua per Zona 1: **{result['remaining_efd_km']:.2f} km**")
+        st.write(f"Tempo in Zona 1: **{seconds_to_hhmm(result['time_z1_h'] * 3600)}**")
+        st.write(f"EFS Zona 1 usata: **{result['efs_z1_used']:.2f} km/h**")
+
+
 if st.button("🎯 Calcola previsione", key="compute_race_time"):
     if race_efd_m is None:
         st.error("⚠️ Carica prima un file gara valido (sezione 1).")
     elif not zone_efs_ref:
         st.error("⚠️ Nessun dato EFS di riferimento disponibile (sezione 2).")
+    elif not compare_mode:
+        result = compute_race_time(t_z2, t_z3, t_z4, t_z5, zone_efs_ref, race_efd_m, use_cauto)
+        if result["error"]:
+            st.error(f"⚠️ {result['error']}")
+        else:
+            display_result(result)
     else:
-        total_efd_km = race_efd_m / 1000
-        zone_times_h = {"Z5": t_z5, "Z4": t_z4, "Z3": t_z3, "Z2": t_z2}
- 
-        remaining_efd_km = total_efd_km
-        capped = False
-        capped_zone = None
-        breakdown = []
-        missing_efs = False
- 
-        # Si procede dalla zona più alta (Z5) alla più bassa (Z2), sottraendo
-        # via via l'EFD "consumata" da ciascun vincolo orario. Se in un
-        # qualunque momento l'EFD residua andrebbe sotto zero, si tronca
-        # quella zona a ciò che resta e ci si ferma (le zone successive
-        # -incluse eventuali zone più basse e la Zona 1- non ricevono EFD).
-        for zname in ["Z5", "Z4", "Z3", "Z2"]:
-            t_h = zone_times_h[zname]
-            efs = zone_efs_ref.get(zname)
- 
-            if t_h > 0 and (efs is None or efs <= 0):
-                st.error(f"⚠️ Manca l'EFS di riferimento per la {zname}: impossibile calcolare.")
-                missing_efs = True
-                break
- 
-            contrib_km = t_h * (efs or 0.0)
- 
-            if remaining_efd_km - contrib_km <= 0:
-                breakdown.append({
-                    "Zona": zname, "Tempo (h)": t_h,
-                    "EFD coperta (km)": round(remaining_efd_km, 2),
-                })
-                remaining_efd_km = 0.0
-                capped = True
-                capped_zone = zname
-                break
-            else:
-                breakdown.append({
-                    "Zona": zname, "Tempo (h)": t_h,
-                    "EFD coperta (km)": round(contrib_km, 2),
-                })
-                remaining_efd_km -= contrib_km
- 
-        if not missing_efs:
-            efs_z1 = zone_efs_ref.get("Z1")
-            if efs_z1 is None or efs_z1 <= 0:
-                st.error("⚠️ Manca l'EFS di riferimento per la Zona 1: impossibile calcolare il tempo restante.")
-            else:
-                time_z1_h = (remaining_efd_km / efs_z1) if remaining_efd_km > 0 else 0.0
-                race_time_h = time_z1_h + t_z2 + t_z3 + t_z4 + t_z5
- 
-                st.metric("⏱️ Tempo di gara previsto", seconds_to_hhmm(race_time_h * 3600))
- 
-                if capped:
-                    st.warning(
-                        f"⚠️ I vincoli orari inseriti richiedono più EFD di quanta ne offra il percorso "
-                        f"gara: la {capped_zone} è stata troncata e la Zona 1 non contribuisce "
-                        f"(tempo = 0h). Il profilo scelto non è sostenibile su questa distanza."
-                    )
- 
-                with st.expander("Dettaglio calcolo"):
-                    st.write(f"EFD totale gara: **{total_efd_km:.2f} km**")
-                    st.dataframe(
-                        pd.DataFrame(breakdown), use_container_width=True, hide_index=True
-                    )
-                    st.write(f"EFD residua per Zona 1: **{remaining_efd_km:.2f} km**")
-                    st.write(f"Tempo in Zona 1: **{seconds_to_hhmm(time_z1_h * 3600)}**")
-                    st.write(f"EFS Zona 1 usata: **{efs_z1:.2f} km/h**")
+        result_a = compute_race_time(t_z2_a, t_z3_a, t_z4_a, t_z5_a, zone_efs_ref, race_efd_m, use_cauto_a)
+        result_b = compute_race_time(t_z2_b, t_z3_b, t_z4_b, t_z5_b, zone_efs_ref, race_efd_m, use_cauto_b)
+
+        if result_a["error"]:
+            st.error(f"⚠️ Profilo A: {result_a['error']}")
+        if result_b["error"]:
+            st.error(f"⚠️ Profilo B: {result_b['error']}")
+
+        if not result_a["error"] and not result_b["error"]:
+            times_h = [result_a["race_time_h"], result_b["race_time_h"]]
+            low_h, high_h = min(times_h), max(times_h)
+            st.metric(
+                "⏱️ Range tempo di gara previsto",
+                f"{seconds_to_hhmm(low_h * 3600)} – {seconds_to_hhmm(high_h * 3600)}",
+            )
+            st.caption(
+                f"Profilo A ({preset_a}): {seconds_to_hhmm(result_a['race_time_h'] * 3600)}  ·  "
+                f"Profilo B ({preset_b}): {seconds_to_hhmm(result_b['race_time_h'] * 3600)}"
+            )
+
+        if not result_a["error"]:
+            display_result(result_a, label="Profilo A")
+        if not result_b["error"]:
+            display_result(result_b, label="Profilo B")

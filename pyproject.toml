@@ -6,10 +6,10 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "fitparse>=1.2.0",
-    "numpy>=2.4.4",
+    "numpy>=2.5.1",
     "pandas>=3.0.3",
-    "plotly>=6.8.0",
-    "streamlit>=1.58.0",
+    "plotly>=6.9.0",
+    "streamlit>=1.59.2",
 ]
 
 [tool.uv]

@@ -14,6 +14,12 @@ Include inoltre un modulo opzionale di "Lap Analysis" manuale: l'utente
 definisce dei lap (in km) su un file a scelta e ottiene, per ciascun lap,
 distanza, EFD, tempo e velocità equivalente pianeggiante media.
 
+Include infine un modulo "Race Plan": definiti dei lap sul percorso gara
+(km reali), calcola per ciascuno il tempo di passaggio previsto tenendo
+conto del decadimento dell'EFS in funzione dell'EFD accumulato (equazione
+cubica calibrata su dati storici), calibrando i tempi lap-per-lap in modo
+che il totale torni esatto rispetto alla previsione di sezione 4.
+
 Run with:
     streamlit run streamlit_app.py
 """
@@ -456,7 +462,13 @@ def parse_gpx(file_obj) -> pd.DataFrame:
 # Calcolo EFD totale di un percorso (nessuna HR/zona richiesta)
 # ---------------------------------------------------------------------------
 def compute_race_efd(df: pd.DataFrame, smooth_window: int, resample_step_m: float):
-    """Calcola EFD totale (m), distanza orizzontale, D+/D- per un percorso gara."""
+    """
+    Calcola EFD totale (m), distanza orizzontale, D+/D- per un percorso gara.
+    Ritorna (summary, profile) dove profile è un DataFrame con la mappa
+    km percorso (distanza orizzontale cumulata, "km" reali) -> EFD cumulato
+    (in km), usata poi dal Race Plan (sezione 5) per convertire un punto
+    del percorso nel corrispondente EFD accumulato.
+    """
     lat, lon, ele = df["lat"].to_numpy(), df["lon"].to_numpy(), df["ele"].to_numpy()
  
     ele_smooth = (pd.Series(ele)
@@ -468,7 +480,7 @@ def compute_race_efd(df: pd.DataFrame, smooth_window: int, resample_step_m: floa
     cum_dist = np.concatenate([[0.0], np.cumsum(seg_dist)])
     total_dist = cum_dist[-1]
     if total_dist <= 0:
-        return None
+        return None, None
  
     n_steps = max(2, int(total_dist // resample_step_m))
     grid = np.linspace(0.0, total_dist, n_steps)
@@ -485,13 +497,20 @@ def compute_race_efd(df: pd.DataFrame, smooth_window: int, resample_step_m: floa
  
     d_plus = float(dz[dz > 0].sum())
     d_minus = float(-dz[dz < 0].sum())
+
+    cum_efd_m = np.concatenate([[0.0], np.cumsum(efd_m)])
+    profile = pd.DataFrame({
+        "km": grid / 1000,
+        "cum_efd_km": cum_efd_m / 1000,
+    })
  
-    return {
+    summary = {
         "horizontal_distance_m": total_dist,
         "d_plus_m": d_plus,
         "d_minus_m": d_minus,
         "efd_m": float(efd_m.sum()),
     }
+    return summary, profile
  
  
 # ===========================================================
@@ -529,11 +548,13 @@ if race_files:
         if df_race is None or len(df_race) < 2:
             st.error("⚠️ Traccia gara non valida: mancano punti GPS sufficienti.")
         else:
-            race_summary = compute_race_efd(df_race, smooth_window, resample_step)
+            race_summary, race_profile = compute_race_efd(df_race, smooth_window, resample_step)
             if race_summary is None:
                 st.error("⚠️ Impossibile calcolare l'EFD per questo percorso (traccia degenere).")
             else:
                 st.session_state["race_efd_m"] = race_summary["efd_m"]
+                st.session_state["race_profile"] = race_profile
+                st.session_state["race_total_km"] = race_summary["horizontal_distance_m"] / 1000
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Distanza orizzontale", f"{race_summary['horizontal_distance_m']/1000:.2f} km")
                 c2.metric("D+ / D−", f"{race_summary['d_plus_m']:.0f} m / {race_summary['d_minus_m']:.0f} m")
@@ -772,8 +793,12 @@ if st.button("🎯 Calcola previsione", key="compute_race_time"):
         result = compute_race_time(t_z2, t_z3, t_z4, t_z5, zone_efs_ref, race_efd_m, use_cauto)
         if result["error"]:
             st.error(f"⚠️ {result['error']}")
+            st.session_state["prediction_ready"] = False
         else:
             display_result(result)
+            st.session_state["prediction_ready"] = True
+            st.session_state["prediction_compare_mode"] = False
+            st.session_state["result_single"] = result
     else:
         result_a = compute_race_time(t_z2_a, t_z3_a, t_z4_a, t_z5_a, zone_efs_ref, race_efd_m, use_cauto_a)
         result_b = compute_race_time(t_z2_b, t_z3_b, t_z4_b, t_z5_b, zone_efs_ref, race_efd_m, use_cauto_b)
@@ -794,8 +819,216 @@ if st.button("🎯 Calcola previsione", key="compute_race_time"):
                 f"Profilo A ({preset_a}): {seconds_to_hhmm(result_a['race_time_h'] * 3600)}  ·  "
                 f"Profilo B ({preset_b}): {seconds_to_hhmm(result_b['race_time_h'] * 3600)}"
             )
+            st.session_state["prediction_ready"] = True
+            st.session_state["prediction_compare_mode"] = True
+            st.session_state["result_a"] = result_a
+            st.session_state["result_b"] = result_b
+            st.session_state["preset_a_label"] = preset_a
+            st.session_state["preset_b_label"] = preset_b
+        else:
+            st.session_state["prediction_ready"] = False
 
         if not result_a["error"]:
             display_result(result_a, label="Profilo A")
         if not result_b["error"]:
             display_result(result_b, label="Profilo B")
+
+
+# ===========================================================
+# UI — Race Plan (tempi di passaggio ai lap)
+# ===========================================================
+st.divider()
+st.header("🗺️ Race Plan")
+
+prediction_ready = st.session_state.get("prediction_ready", False)
+
+if not prediction_ready:
+    st.info(
+        "ℹ️ Calcola prima una previsione tempo gara (sezione 4, pulsante "
+        "'🎯 Calcola previsione') per poter costruire il race plan."
+    )
+else:
+    want_plan = st.radio(
+        "Vuoi costruire un race plan con i tempi di passaggio intermedi?",
+        ["No", "Sì"],
+        horizontal=True,
+        key="want_race_plan",
+    )
+
+    if want_plan == "Sì":
+        race_profile = st.session_state.get("race_profile")
+        race_total_km = st.session_state.get("race_total_km")
+
+        if race_profile is None or race_total_km is None:
+            st.error("⚠️ Profilo del percorso non disponibile: ricarica il file gara in sezione 1.")
+        else:
+            st.caption(
+                f"Distanza totale percorso: **{race_total_km:.2f} km**. "
+                "Definisci i segmenti di tuo interesse con km di partenza e arrivo"
+            )
+
+            lap_input_method = st.radio(
+                "Come vuoi inserire i segmenti?", ["Manualmente", "Importa CSV"], horizontal=True, key="lap_input_method"
+            )
+
+            laps_df = None
+
+            if lap_input_method == "Manualmente":
+                default_laps = pd.DataFrame({
+                    "name": ["Lap 1"],
+                    "start_km": [0.0],
+                    "end_km": [round(min(10.0, race_total_km), 2)],
+                })
+                laps_edit = st.data_editor(
+                    st.session_state.get("laps_editor_data", default_laps),
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    key="laps_editor",
+                    column_config={
+                        "name": st.column_config.TextColumn("Nome lap"),
+                        "start_km": st.column_config.NumberColumn(
+                            "Km partenza", min_value=0.0, max_value=float(race_total_km), step=0.1
+                        ),
+                        "end_km": st.column_config.NumberColumn(
+                            "Km arrivo", min_value=0.0, max_value=float(race_total_km), step=0.1
+                        ),
+                    },
+                )
+                st.session_state["laps_editor_data"] = laps_edit
+                laps_df = laps_edit.copy()
+            else:
+                uploaded_laps_csv = st.file_uploader(
+                    "Carica CSV lap (colonne: name, start_km, end_km)", type=["csv"], key="laps_csv"
+                )
+                if uploaded_laps_csv is not None:
+                    try:
+                        laps_df = pd.read_csv(uploaded_laps_csv)
+                        required = {"name", "start_km", "end_km"}
+                        if not required.issubset(set(laps_df.columns)):
+                            st.error("⚠️ Il CSV deve contenere le colonne: name, start_km, end_km")
+                            laps_df = None
+                        else:
+                            laps_df = laps_df[["name", "start_km", "end_km"]]
+                    except Exception as e:
+                        st.error(f"⚠️ Errore durante la lettura del CSV: {e}")
+                        laps_df = None
+
+            if laps_df is not None and not laps_df.empty:
+                laps_df = laps_df.dropna(subset=["name", "start_km", "end_km"]).reset_index(drop=True)
+                laps_df["start_km"] = laps_df["start_km"].astype(float)
+                laps_df["end_km"] = laps_df["end_km"].astype(float)
+
+                errors = []
+                if (laps_df["start_km"] >= laps_df["end_km"]).any():
+                    errors.append("Ogni lap deve avere km partenza < km arrivo.")
+                if (laps_df["end_km"] > race_total_km + 1e-6).any():
+                    errors.append(f"Nessun lap può superare i {race_total_km:.2f} km del percorso.")
+                if (laps_df["start_km"] < -1e-6).any():
+                    errors.append("I km di partenza non possono essere negativi.")
+
+                if errors:
+                    for err in errors:
+                        st.error(f"⚠️ {err}")
+                else:
+                    def cum_efd_at_km(km_value):
+                        return float(np.interp(km_value, race_profile["km"], race_profile["cum_efd_km"]))
+
+                    def build_plan_for_profile(result, label):
+                        """
+                        Per ciascun lap:
+                          - e = EFD cumulato (valore assoluto) al km di ARRIVO del lap
+                          - ΔEFS(%) dall'equazione cubica (Minetti/decadence fit)
+                          - EFS lap = baseline_efs * (1 + ΔEFS%/100), baseline_efs =
+                            EFD totale gara / tempo di gara previsto (EFS media pesata
+                            del profilo)
+                          - tempo lap grezzo = EFD del lap / EFS lap
+                        I tempi grezzi vengono infine calibrati con un fattore unico in
+                        modo che la somma torni esatta al tempo di gara previsto.
+                        """
+                        baseline_efs = result["total_efd_km"] / result["race_time_h"]
+                        rows = []
+                        raw_times_h = []
+                        for _, lap in laps_df.iterrows():
+                            efd_start = cum_efd_at_km(lap["start_km"])
+                            efd_end = cum_efd_at_km(lap["end_km"])
+                            efd_lap_km = max(efd_end - efd_start, 0.0)
+                            e = abs(efd_end)  # EFD accumulato a fine lap
+                            delta_pct = (38.204 - 1.2831 * e + 0.01336 * e**2 - 0.000047 * e**3)
+                            efs_lap = baseline_efs * (1 + delta_pct / 100)
+                            if efs_lap <= 0:
+                                efs_lap = baseline_efs * 0.05  # floor di sicurezza
+                            time_h = efd_lap_km / efs_lap
+                            raw_times_h.append(time_h)
+                            rows.append({
+                                "Lap": lap["name"],
+                                "Km partenza": lap["start_km"],
+                                "Km arrivo": lap["end_km"],
+                                "EFD lap (km)": efd_lap_km,
+                                "EFD accumulato (km)": e,
+                                "EFS lap (km/h)": efs_lap,
+                            })
+
+                        raw_times_h = np.array(raw_times_h)
+                        total_raw_h = raw_times_h.sum()
+                        calib_factor = (result["race_time_h"] / total_raw_h) if total_raw_h > 0 else 1.0
+                        final_times_h = raw_times_h * calib_factor
+                        cum_times_h = np.cumsum(final_times_h)
+
+                        out = pd.DataFrame(rows)
+                        out[f"Tempo lap ({label})"] = [seconds_to_hhmm(t * 3600) for t in final_times_h]
+                        out[f"Arrivo cumulato ({label})"] = [seconds_to_hhmm(t * 3600) for t in cum_times_h]
+                        return out, calib_factor
+
+                    compare = st.session_state.get("prediction_compare_mode", False)
+
+                    if not compare:
+                        result = st.session_state.get("result_single")
+                        plan_df, calib = build_plan_for_profile(result, "gara")
+                        st.caption(f"Fattore di calibrazione applicato: ×{calib:.3f}")
+                        display_cols = ["Lap", "Km partenza", "Km arrivo", "EFD lap (km)",
+                                         "EFD accumulato (km)", "EFS lap (km/h)",
+                                         "Tempo lap (gara)", "Arrivo cumulato (gara)"]
+                        st.dataframe(
+                            plan_df[display_cols].style.format({
+                                "Km partenza": "{:.2f}", "Km arrivo": "{:.2f}",
+                                "EFD lap (km)": "{:.2f}", "EFD accumulato (km)": "{:.2f}",
+                                "EFS lap (km/h)": "{:.2f}",
+                            }),
+                            use_container_width=True, hide_index=True,
+                        )
+                        st.download_button(
+                            "📥 Scarica race plan (CSV)",
+                            data=plan_df[display_cols].to_csv(index=False).encode("utf-8"),
+                            file_name="race_plan.csv",
+                            mime="text/csv",
+                        )
+                    else:
+                        result_a = st.session_state.get("result_a")
+                        result_b = st.session_state.get("result_b")
+                        label_a = st.session_state.get("preset_a_label", "A")
+                        label_b = st.session_state.get("preset_b_label", "B")
+
+                        plan_a, calib_a = build_plan_for_profile(result_a, label_a)
+                        plan_b, calib_b = build_plan_for_profile(result_b, label_b)
+
+                        merged = plan_a[["Lap", "Km partenza", "Km arrivo", "EFD lap (km)"]].copy()
+                        merged[f"Tempo lap ({label_a})"] = plan_a[f"Tempo lap ({label_a})"]
+                        merged[f"Arrivo cumulato ({label_a})"] = plan_a[f"Arrivo cumulato ({label_a})"]
+                        merged[f"Tempo lap ({label_b})"] = plan_b[f"Tempo lap ({label_b})"]
+                        merged[f"Arrivo cumulato ({label_b})"] = plan_b[f"Arrivo cumulato ({label_b})"]
+
+                        st.caption(
+                            f"Fattore di calibrazione: {label_a} ×{calib_a:.3f} · {label_b} ×{calib_b:.3f}"
+                        )
+                        st.dataframe(
+                            merged.style.format({
+                                "Km partenza": "{:.2f}", "Km arrivo": "{:.2f}", "EFD lap (km)": "{:.2f}",
+                            }),
+                            use_container_width=True, hide_index=True,
+                        )
+                        st.download_button(
+                            "📥 Scarica race plan (CSV)",
+                            data=merged.to_csv(index=False).encode("utf-8"),
+                            file_name="race_plan_confronto.csv",
+                            mime="text/csv",
+                        )

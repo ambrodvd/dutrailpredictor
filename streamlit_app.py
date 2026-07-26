@@ -844,8 +844,7 @@ prediction_ready = st.session_state.get("prediction_ready", False)
 
 if not prediction_ready:
     st.info(
-        "ℹ️ Calcola prima una previsione tempo gara (sezione 4, pulsante "
-        "'🎯 Calcola previsione') per poter costruire il race plan."
+        "ℹ️ Calcola una previsione di gara per poter costruire il race plan."
     )
 else:
     want_plan = st.radio(
@@ -978,7 +977,7 @@ else:
 
                         out = pd.DataFrame(rows)
                         out["Velocità (km/h)"]= np.divide(
-                            out["distanza (km)"].to_numpy(), final_times_h,
+                            out["Distanza (km)"].to_numpy(), final_times_h,
                             out=np.zeros_like(final_times_h), where=final_times_h > 0
                         )
                         out[f"Tempo lap ({label})"] = [seconds_to_hhmm(t * 3600) for t in final_times_h]
@@ -992,7 +991,7 @@ else:
                         plan_df, calib = build_plan_for_profile(result, "gara")
                         st.caption(f"Fattore di calibrazione applicato: ×{calib:.3f}")
                         display_cols = ["Lap", "Km partenza", "Km arrivo", "Distanza (km)",
-                                         "Velocità (km/h)"
+                                         "Velocità (km/h)",
                                          "Tempo lap (gara)", "Arrivo cumulato (gara)"]
                         st.dataframe(
                             plan_df[display_cols].style.format({
@@ -1019,7 +1018,7 @@ else:
 
                         merged = plan_a[["Lap", "Km partenza", "Km arrivo", "Distanza (km)"]].copy()
                         merged[f"Velocità ({label_a}) km/h"] = plan_a["Velocità (km/h)"]
-                        merged[f"Tempo segmento ({label_a})"] = plan_a[f"Tempo segmento ({label_a})"]
+                        merged[f"Tempo segmento ({label_a})"] = plan_a[f"Tempo lap ({label_a})"]
                         merged[f"Tempo di gara ({label_a})"] = plan_a[f"Arrivo cumulato ({label_a})"]
 
                         merged[f"Velocità ({label_b}) km/h"] = plan_b["Velocità (km/h)"]

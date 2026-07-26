@@ -863,72 +863,79 @@ else:
         else:
             st.caption(
                 f"Distanza totale percorso: **{race_total_km:.2f} km**. "
-                "Definisci i segmenti di tuo interesse con km di partenza e arrivo"
             )
 
-            lap_input_method = st.radio(
-                "Come vuoi inserire i segmenti?", ["Manualmente", "Importa CSV"], horizontal=True, key="lap_input_method"
+            n_segments = st.number_input(
+                "Quanti segmenti vuoi creare?",
+                min_value=1, max_value=50, step=1,
+                key="n_segments_input",
             )
 
-            laps_df = None
+            with st.form("segments_form"):
 
-            if lap_input_method == "Manualmente":
-                default_laps = pd.DataFrame({
-                    "name": ["Lap 1"],
-                    "start_km": [0.0],
-                    "end_km": [round(min(10.0, race_total_km), 2)],
-                })
-                laps_edit = st.data_editor(
-                    st.session_state.get("laps_editor_data", default_laps),
-                    num_rows="dynamic",
-                    use_container_width=True,
-                    key="laps_editor",
-                    column_config={
-                        "name": st.column_config.TextColumn("Nome lap"),
-                        "start_km": st.column_config.NumberColumn(
-                            "Km partenza", min_value=0.0, max_value=float(race_total_km), step=0.1
-                        ),
-                        "end_km": st.column_config.NumberColumn(
-                            "Km arrivo", min_value=0.0, max_value=float(race_total_km), step=0.1
-                        ),
-                    },
-                )
-                st.session_state["laps_editor_data"] = laps_edit
-                laps_df = laps_edit.copy()
-            else:
-                uploaded_laps_csv = st.file_uploader(
-                    "Carica CSV lap (colonne: name, start_km, end_km)", type=["csv"], key="laps_csv"
-                )
-                if uploaded_laps_csv is not None:
-                    try:
-                        laps_df = pd.read_csv(uploaded_laps_csv)
-                        required = {"name", "start_km", "end_km"}
-                        if not required.issubset(set(laps_df.columns)):
-                            st.error("⚠️ Il CSV deve contenere le colonne: name, start_km, end_km")
-                            laps_df = None
-                        else:
-                            laps_df = laps_df[["name", "start_km", "end_km"]]
-                    except Exception as e:
-                        st.error(f"⚠️ Errore durante la lettura del CSV: {e}")
-                        laps_df = None
+                seg_names = []
+                seg_ends = []
+                for i in range(n_segments):
+                    is_last = (i == n_segments - 1)
+                    default_end = (
+                        race_total_km if is_last
+                        else round(race_total_km * (i + 1) / n_segments, 2)
+                    )
+                    c1, c2 = st.columns([2, 1])
+                    name_i = c1.text_input(
+                        f"Nome segmento {i + 1}",
+                        value=f"Segmento {i + 1}",
+                        key=f"seg_name_{i}",
+                    )
+                    end_i = c2.number_input(
+                        f"Km finale segmento {i + 1}",
+                        min_value=0.0, max_value=float(race_total_km),
+                        value=float(default_end), step=0.1,
+                        disabled=is_last,
+                        key=f"seg_end_{i}",
+                    )
+                    seg_names.append(name_i)
+                    seg_ends.append(race_total_km if is_last else end_i)
 
-            if laps_df is not None and not laps_df.empty:
-                laps_df = laps_df.dropna(subset=["name", "start_km", "end_km"]).reset_index(drop=True)
-                laps_df["start_km"] = laps_df["start_km"].astype(float)
-                laps_df["end_km"] = laps_df["end_km"].astype(float)
+                submitted_segments = st.form_submit_button("💾 Salva segmenti")
 
+            if submitted_segments:
                 errors = []
-                if (laps_df["start_km"] >= laps_df["end_km"]).any():
-                    errors.append("Ogni lap deve avere km partenza < km arrivo.")
-                if (laps_df["end_km"] > race_total_km + 1e-6).any():
-                    errors.append(f"Nessun lap può superare i {race_total_km:.2f} km del percorso.")
-                if (laps_df["start_km"] < -1e-6).any():
-                    errors.append("I km di partenza non possono essere negativi.")
-
+                for i in range(1, n_segments):
+                    if seg_ends[i] <= seg_ends[i - 1] + 1e-9:
+                        errors.append(
+                            f"Il km finale del segmento {i + 1} deve essere maggiore "
+                            f"di quello del segmento {i}."
+                        )
                 if errors:
                     for err in errors:
                         st.error(f"⚠️ {err}")
+                    st.session_state["laps_df_confirmed"] = None
                 else:
+                    start_list = [0.0] + seg_ends[:-1]
+                    final_names = [
+                        n.strip() if n.strip() else f"Segmento {i + 1}"
+                        for i, n in enumerate(seg_names)
+                    ]
+                    st.session_state["laps_df_confirmed"] = pd.DataFrame({
+                        "name": final_names,
+                        "start_km": start_list,
+                        "end_km": seg_ends,
+                    })
+                    st.success(f"✅ {n_segments} segmenti salvati.")
+
+            laps_df = st.session_state.get("laps_df_confirmed")
+
+            if laps_df is not None and not laps_df.empty:
+                st.dataframe(
+                    laps_df.rename(columns={
+                        "name": "Nome", "start_km": "Km partenza", "end_km": "Km arrivo",
+                    }).style.format({"Km partenza": "{:.2f}", "Km arrivo": "{:.2f}"}),
+                    use_container_width=True, hide_index=True,
+                )
+
+            if laps_df is not None and not laps_df.empty:
+                if st.button("🎯 Calcola Race Plan definitivo", key="compute_race_plan_button"):
                     def cum_efd_at_km(km_value):
                         return float(np.interp(km_value, race_profile["km"], race_profile["cum_efd_km"]))
 
@@ -976,12 +983,12 @@ else:
                         cum_times_h = np.cumsum(final_times_h)
 
                         out = pd.DataFrame(rows)
-                        out["Velocità (km/h)"]= np.divide(
+                        out["Velocità (km/h)"] = np.divide(
                             out["Distanza (km)"].to_numpy(), final_times_h,
                             out=np.zeros_like(final_times_h), where=final_times_h > 0
                         )
-                        out[f"Tempo lap ({label})"] = [seconds_to_hhmm(t * 3600) for t in final_times_h]
-                        out[f"Arrivo cumulato ({label})"] = [seconds_to_hhmm(t * 3600) for t in cum_times_h]
+                        out[f"Tempo segmento ({label})"] = [seconds_to_hhmm(t * 3600) for t in final_times_h]
+                        out[f"Tempo di gara ({label})"] = [seconds_to_hhmm(t * 3600) for t in cum_times_h]
                         return out, calib_factor
 
                     compare = st.session_state.get("prediction_compare_mode", False)
@@ -989,10 +996,14 @@ else:
                     if not compare:
                         result = st.session_state.get("result_single")
                         plan_df, calib = build_plan_for_profile(result, "gara")
+                        plan_df = plan_df.rename(columns={
+                            "Tempo segmento (gara)": "Tempo segmento",
+                            "Tempo di gara (gara)": "Tempo di gara",
+                        })
                         st.caption(f"Fattore di calibrazione applicato: ×{calib:.3f}")
                         display_cols = ["Lap", "Km partenza", "Km arrivo", "Distanza (km)",
                                          "Velocità (km/h)",
-                                         "Tempo lap (gara)", "Arrivo cumulato (gara)"]
+                                         "Tempo segmento", "Tempo di gara"]
                         st.dataframe(
                             plan_df[display_cols].style.format({
                                 "Km partenza": "{:.2f}", "Km arrivo": "{:.2f}",
@@ -1018,12 +1029,12 @@ else:
 
                         merged = plan_a[["Lap", "Km partenza", "Km arrivo", "Distanza (km)"]].copy()
                         merged[f"Velocità ({label_a}) km/h"] = plan_a["Velocità (km/h)"]
-                        merged[f"Tempo segmento ({label_a})"] = plan_a[f"Tempo lap ({label_a})"]
-                        merged[f"Tempo di gara ({label_a})"] = plan_a[f"Arrivo cumulato ({label_a})"]
+                        merged[f"Tempo segmento ({label_a})"] = plan_a[f"Tempo segmento ({label_a})"]
+                        merged[f"Tempo di gara ({label_a})"] = plan_a[f"Tempo di gara ({label_a})"]
 
                         merged[f"Velocità ({label_b}) km/h"] = plan_b["Velocità (km/h)"]
-                        merged[f"Tempo segmento ({label_b})"] = plan_b[f"Tempo lap ({label_b})"]
-                        merged[f"Tempo di gara ({label_b})"] = plan_b[f"Arrivo cumulato ({label_b})"]
+                        merged[f"Tempo segmento ({label_b})"] = plan_b[f"Tempo segmento ({label_b})"]
+                        merged[f"Tempo di gara ({label_b})"] = plan_b[f"Tempo di gara ({label_b})"]
 
                         st.caption(
                             f"Fattore di calibrazione: {label_a} ×{calib_a:.3f} · {label_b} ×{calib_b:.3f}"

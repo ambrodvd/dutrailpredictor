@@ -953,6 +953,7 @@ else:
                             efd_end = cum_efd_at_km(lap["end_km"])
                             efd_lap_km = max(efd_end - efd_start, 0.0)
                             e = abs(efd_end)  # EFD accumulato a fine lap
+                            dist_lap_km = lap["end_km"] - lap["start_km"]
                             delta_pct = (38.204 - 1.2831 * e + 0.01336 * e**2 - 0.000047 * e**3)
                             efs_lap = baseline_efs * (1 + delta_pct / 100)
                             if efs_lap <= 0:
@@ -963,6 +964,7 @@ else:
                                 "Lap": lap["name"],
                                 "Km partenza": lap["start_km"],
                                 "Km arrivo": lap["end_km"],
+                                "Distanza (km)": dist_lap_km,
                                 "EFD lap (km)": efd_lap_km,
                                 "EFD accumulato (km)": e,
                                 "EFS lap (km/h)": efs_lap,
@@ -975,6 +977,10 @@ else:
                         cum_times_h = np.cumsum(final_times_h)
 
                         out = pd.DataFrame(rows)
+                        out["Velocità (km/h)"]= np.divide(
+                            out["distanza (km)"].to_numpy(), final_times_h,
+                            out=np.zeros_like(final_times_h), where=final_times_h > 0
+                        )
                         out[f"Tempo lap ({label})"] = [seconds_to_hhmm(t * 3600) for t in final_times_h]
                         out[f"Arrivo cumulato ({label})"] = [seconds_to_hhmm(t * 3600) for t in cum_times_h]
                         return out, calib_factor
@@ -985,14 +991,14 @@ else:
                         result = st.session_state.get("result_single")
                         plan_df, calib = build_plan_for_profile(result, "gara")
                         st.caption(f"Fattore di calibrazione applicato: ×{calib:.3f}")
-                        display_cols = ["Lap", "Km partenza", "Km arrivo", "EFD lap (km)",
-                                         "EFD accumulato (km)", "EFS lap (km/h)",
+                        display_cols = ["Lap", "Km partenza", "Km arrivo", "Distanza (km)",
+                                         "Velocità (km/h)"
                                          "Tempo lap (gara)", "Arrivo cumulato (gara)"]
                         st.dataframe(
                             plan_df[display_cols].style.format({
                                 "Km partenza": "{:.2f}", "Km arrivo": "{:.2f}",
-                                "EFD lap (km)": "{:.2f}", "EFD accumulato (km)": "{:.2f}",
-                                "EFS lap (km/h)": "{:.2f}",
+                                "Distanza (km)": "{:.2f}",
+                                "Velocità (km/h)": "{:.1f}"
                             }),
                             use_container_width=True, hide_index=True,
                         )
@@ -1011,18 +1017,25 @@ else:
                         plan_a, calib_a = build_plan_for_profile(result_a, label_a)
                         plan_b, calib_b = build_plan_for_profile(result_b, label_b)
 
-                        merged = plan_a[["Lap", "Km partenza", "Km arrivo", "EFD lap (km)"]].copy()
-                        merged[f"Tempo lap ({label_a})"] = plan_a[f"Tempo lap ({label_a})"]
-                        merged[f"Arrivo cumulato ({label_a})"] = plan_a[f"Arrivo cumulato ({label_a})"]
-                        merged[f"Tempo lap ({label_b})"] = plan_b[f"Tempo lap ({label_b})"]
-                        merged[f"Arrivo cumulato ({label_b})"] = plan_b[f"Arrivo cumulato ({label_b})"]
+                        merged = plan_a[["Lap", "Km partenza", "Km arrivo", "Distanza (km)"]].copy()
+                        merged[f"Velocità ({label_a}) km/h"] = plan_a["Velocità (km/h)"]
+                        merged[f"Tempo segmento ({label_a})"] = plan_a[f"Tempo segmento ({label_a})"]
+                        merged[f"Tempo di gara ({label_a})"] = plan_a[f"Arrivo cumulato ({label_a})"]
+
+                        merged[f"Velocità ({label_b}) km/h"] = plan_b["Velocità (km/h)"]
+                        merged[f"Tempo segmento ({label_b})"] = plan_b[f"Tempo lap ({label_b})"]
+                        merged[f"Tempo di gara ({label_b})"] = plan_b[f"Arrivo cumulato ({label_b})"]
 
                         st.caption(
                             f"Fattore di calibrazione: {label_a} ×{calib_a:.3f} · {label_b} ×{calib_b:.3f}"
                         )
                         st.dataframe(
                             merged.style.format({
-                                "Km partenza": "{:.2f}", "Km arrivo": "{:.2f}", "EFD lap (km)": "{:.2f}",
+                                "Km partenza": "{:.2f}", 
+                                "Km arrivo": "{:.2f}",
+                                "Distanza (km)": "{:.2f}",
+                                f"Velocità ({label_a}) km/h": "{:.1f}",
+                                f"Velocità ({label_b}) km/h": "{:.1f}",
                             }),
                             use_container_width=True, hide_index=True,
                         )

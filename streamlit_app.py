@@ -16,9 +16,33 @@ distanza, EFD, tempo e velocità equivalente pianeggiante media.
 
 Include infine un modulo "Race Plan": definiti dei lap sul percorso gara
 (km reali), calcola per ciascuno il tempo di passaggio previsto tenendo
-conto del decadimento dell'EFS in funzione dell'EFD accumulato (equazione
-cubica calibrata su dati storici), calibrando i tempi lap-per-lap in modo
-che il totale torni esatto rispetto alla previsione di sezione 4.
+conto del decadimento dell'EFS in funzione dell'EFD accumulato (modello
+a bucket per lunghezza gara, calibrato su dati storici, con interpolazione
+tra bucket adiacenti), calibrando i tempi lap-per-lap in modo che il totale
+torni esatto rispetto alla previsione di sezione 4.
+
+--------------------------------------------------------------------------
+NOTA SULLE PERFORMANCE (importante se modifichi il file)
+--------------------------------------------------------------------------
+Streamlit ri-esegue l'intero script a ogni interazione con un qualsiasi
+widget (slider, radio, bottone...), anche uno lontano dalla sezione in
+questione. Senza caching questo significa ri-parsare TUTTI i file .fit
+caricati e ri-fare tutto il resampling/integrazione ogni singola volta,
+anche se l'utente ha solo mosso uno slider nella sezione Race Plan.
+
+Per questo il parsing + processing di ogni traccia (.fit o .gpx) è
+racchiuso in funzioni decorate con @st.cache_data, con chiave = bytes
+del file + parametri numerici che influenzano il risultato (smoothing,
+passo di resampling, zone FC). Se questi non cambiano, la chiamata
+successiva è una lookup istantanea invece di un recompute completo.
+
+Regola pratica quando si aggiunge nuova logica di parsing/elaborazione:
+la funzione pesante (fitparse, haversine su array grandi, resampling)
+va SEMPRE dietro una cache_data che riceve bytes/primitivi come argomenti,
+mai un file-like object o un DataFrame già "vivo" come argomento di cache,
+altrimenti la chiave di cache è instabile o l'hashing diventa esso stesso
+il collo di bottiglia.
+--------------------------------------------------------------------------
 
 Run with:
     streamlit run streamlit_app.py
@@ -28,6 +52,7 @@ import io
 import numpy as np
 import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
 from fitparse import FitFile
 import xml.etree.ElementTree as ET
 
@@ -54,6 +79,78 @@ SEMICIRCLE_TO_DEG = 180.0 / (2 ** 31)
 
 
 # ---------------------------------------------------------------------------
+# Modello di decadimento EFS a bucket per lunghezza gara (EFD totale)
+# ---------------------------------------------------------------------------
+# Calibrato separatamente nell'app "Speed Decadence" (dutrailpredictor), che
+# fitta un'equazione per ciascun bucket di EFD totale su "p" = EFD accumulato
+# in % del totale del file (non EFD assoluto: cosi' file/gare di lunghezza
+# diversa restano confrontabili sulla stessa posizione relativa di gara).
+# Qui i coefficienti sono hardcoded: quando si ricalibra su nuovi dati in
+# Speed Decadence, aggiornare i coefficienti sotto di conseguenza.
+#
+# NOTA: il bucket "< 40 km" non ha ancora dati/equazione propria (nessun file
+# idoneo al momento della calibrazione): per gare piu' corte del centro del
+# bucket piu' basso disponibile si usa quella stessa curva (clamp), invece
+# di estrapolare un'equazione mai validata su quel range.
+def _delta_efs_40_60(p):
+    return 23.860 - 0.5984 * p + 0.00263 * p**2
+
+
+def _delta_efs_60_100(p):
+    return 36.833 - 0.7490 * p - 0.00277 * p**2 + 0.000057 * p**3
+
+
+def _delta_efs_100_plus(p):
+    return 41.599 - 1.3125 * p + 0.01342 * p**2 - 0.000064 * p**3
+
+
+BUCKET_DELTA_EFS_FN = {
+    "40-60 km": _delta_efs_40_60,
+    "60-100 km": _delta_efs_60_100,
+    ">100 km": _delta_efs_100_plus,
+}
+
+# Centro di ciascun bucket in km di EFD totale, usato per l'interpolazione.
+# Il centro del bucket ">100 km" non è vincolato da un limite superiore: va
+# aggiornato con la mediana reale dei file di quel bucket (visibile nel
+# pannello diagnostico di Speed Decadence) quando disponibile. Il valore
+# sotto è una stima di partenza, da correggere.
+BUCKET_CENTERS_KM = {
+    "40-60 km": 50.0,
+    "60-100 km": 80.0,
+    ">100 km": 130.0,  # <-- aggiornare con la mediana reale dei file >100 km
+}
+
+_BUCKET_ORDER_BY_CENTER = sorted(BUCKET_CENTERS_KM, key=lambda k: BUCKET_CENTERS_KM[k])
+
+
+def predict_delta_efs_blended(efd_pct: float, race_total_efd_km: float) -> float:
+    """
+    Scostamento % dell'EFS previsto a una posizione di gara (efd_pct, 0-100),
+    interpolando linearmente tra le curve dei due bucket più vicini per
+    centro (in km di EFD totale) in base alla lunghezza della gara target.
+    Questo evita salti bruschi tra bucket adiacenti (es. gara da 99 km vs
+    101 km danno una previsione quasi identica, non un salto netto).
+    """
+    centers = [(name, BUCKET_CENTERS_KM[name]) for name in _BUCKET_ORDER_BY_CENTER]
+
+    if race_total_efd_km <= centers[0][1]:
+        return float(BUCKET_DELTA_EFS_FN[centers[0][0]](efd_pct))
+    if race_total_efd_km >= centers[-1][1]:
+        return float(BUCKET_DELTA_EFS_FN[centers[-1][0]](efd_pct))
+
+    for (name_lo, c_lo), (name_hi, c_hi) in zip(centers[:-1], centers[1:]):
+        if c_lo <= race_total_efd_km <= c_hi:
+            w_hi = (race_total_efd_km - c_lo) / (c_hi - c_lo)
+            w_lo = 1.0 - w_hi
+            pred_lo = BUCKET_DELTA_EFS_FN[name_lo](efd_pct)
+            pred_hi = BUCKET_DELTA_EFS_FN[name_hi](efd_pct)
+            return float(w_lo * pred_lo + w_hi * pred_hi)
+
+    return float("nan")
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def seconds_to_hhmm(seconds) -> str:
@@ -69,7 +166,8 @@ def seconds_to_hhmm(seconds) -> str:
 
 
 # ---------------------------------------------------------------------------
-# .fit parsing
+# .fit / .gpx parsing (pure functions — no Streamlit calls inside, so they
+# are safe to call from cached wrappers below)
 # ---------------------------------------------------------------------------
 def parse_fit(file_obj) -> pd.DataFrame:
     """Extract lat, lon, elevation, heart rate, elapsed time (s) per record."""
@@ -103,6 +201,32 @@ def parse_fit(file_obj) -> pd.DataFrame:
     return df
 
 
+def parse_gpx(file_obj) -> pd.DataFrame:
+    """Estrae lat, lon, elevazione da un file GPX (percorso gara, no HR/tempo)."""
+    tree = ET.parse(file_obj)
+    root = tree.getroot()
+    ns_uri = root.tag.split('}')[0].strip('{') if root.tag.startswith('{') else ''
+
+    def tag(name):
+        return f'{{{ns_uri}}}{name}' if ns_uri else name
+
+    rows = []
+    for trkpt in root.iter(tag('trkpt')):
+        lat_attr = trkpt.get('lat')
+        lon_attr = trkpt.get('lon')
+        if lat_attr is None or lon_attr is None:
+            continue
+        ele_el = trkpt.find(tag('ele'))
+        ele = float(ele_el.text) if ele_el is not None and ele_el.text else np.nan
+        rows.append((float(lat_attr), float(lon_attr), ele))
+
+    df = pd.DataFrame(rows, columns=["lat", "lon", "ele"])
+    if df.empty:
+        return df
+    df["ele"] = df["ele"].ffill().bfill().fillna(0.0)
+    return df
+
+
 def haversine_vec(lat1, lon1, lat2, lon2):
     """Vectorized great-circle distance in meters between arrays of points."""
     R = 6371000.0
@@ -113,19 +237,19 @@ def haversine_vec(lat1, lon1, lat2, lon2):
     return 2 * R * np.arcsin(np.sqrt(a))
 
 
-def hr_to_zone(hr, z1, z2, z3, z4, z5):
-    if np.isnan(hr):
-        return None
-    if hr <= z1:
-        return "Z1"
-    elif hr <= z2:
-        return "Z2"
-    elif hr <= z3:
-        return "Z3"
-    elif hr <= z4:
-        return "Z4"
-    else:
-        return "Z5"
+def hr_to_zone_vec(hr_arr: np.ndarray, z1, z2, z3, z4, z5) -> np.ndarray:
+    """
+    Vectorized HR -> zone assignment (replaces a per-point Python loop).
+    z5 is unused as an upper bound (Z5 = "above z4") but kept in the
+    signature for symmetry with the rest of the app / CSV zone format.
+    Returns an object array with values in {"Z1".."Z5"} or None where hr is NaN.
+    """
+    bins = [z1, z2, z3, z4]  # upper bounds for Z1..Z4; anything above z4 is Z5
+    idx = np.digitize(hr_arr, bins)  # 0..4
+    labels = np.array(["Z1", "Z2", "Z3", "Z4", "Z5"], dtype=object)
+    zones_arr = labels[np.clip(idx, 0, 4)]
+    zones_arr = np.where(np.isnan(hr_arr), None, zones_arr)
+    return zones_arr
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +297,7 @@ def process_track(df: pd.DataFrame, smooth_window: int, resample_step_m: float,
     efs_ms = np.divide(efd_m, dt, out=np.full_like(efd_m, np.nan), where=dt > 0)
 
     hr_seg = (hr_grid[:-1] + hr_grid[1:]) / 2.0   # avg HR across the segment
-    zone = np.array([hr_to_zone(h, *zones) for h in hr_seg])
+    zone = hr_to_zone_vec(hr_seg, *zones)         # vectorized, was a per-point loop
 
     d_plus = float(dz[dz > 0].sum())
     d_minus = float(-dz[dz < 0].sum())
@@ -223,6 +347,112 @@ def zone_efs_table(segments: pd.DataFrame) -> pd.DataFrame:
             "EFS media (km/h)": efs_ms * 3.6,
         })
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Calcolo EFD totale di un percorso (nessuna HR/zona richiesta)
+# ---------------------------------------------------------------------------
+def compute_race_efd(df: pd.DataFrame, smooth_window: int, resample_step_m: float):
+    """
+    Calcola EFD totale (m), distanza orizzontale, D+/D- per un percorso gara.
+    Ritorna (summary, profile) dove profile è un DataFrame con la mappa
+    km percorso (distanza orizzontale cumulata, "km" reali) -> EFD cumulato
+    (in km), usata poi dal Race Plan (sezione 5) per convertire un punto
+    del percorso nel corrispondente EFD accumulato.
+    """
+    lat, lon, ele = df["lat"].to_numpy(), df["lon"].to_numpy(), df["ele"].to_numpy()
+
+    ele_smooth = (pd.Series(ele)
+                  .rolling(window=smooth_window, center=True, min_periods=1)
+                  .mean()
+                  .to_numpy())
+
+    seg_dist = haversine_vec(lat[:-1], lon[:-1], lat[1:], lon[1:])
+    cum_dist = np.concatenate([[0.0], np.cumsum(seg_dist)])
+    total_dist = cum_dist[-1]
+    if total_dist <= 0:
+        return None, None
+
+    n_steps = max(2, int(total_dist // resample_step_m))
+    grid = np.linspace(0.0, total_dist, n_steps)
+    ele_grid = np.interp(grid, cum_dist, ele_smooth)
+
+    dx = np.diff(grid)
+    dz = np.diff(ele_grid)
+    dist3d = np.hypot(dx, dz)
+    slope = np.divide(dz, dx, out=np.zeros_like(dz), where=dx > 0)
+
+    cost = cost_of_running(slope)
+    energy = cost * dist3d
+    efd_m = energy / FLAT_COST
+
+    d_plus = float(dz[dz > 0].sum())
+    d_minus = float(-dz[dz < 0].sum())
+
+    cum_efd_m = np.concatenate([[0.0], np.cumsum(efd_m)])
+
+    # Cumulative D+/D- at each grid point, used later to compute gain/loss
+    # per Race Plan lap (via interpolation) and to draw the elevation chart.
+    dplus_step = np.where(dz > 0, dz, 0.0)
+    dminus_step = np.where(dz < 0, -dz, 0.0)
+    cum_dplus_m = np.concatenate([[0.0], np.cumsum(dplus_step)])
+    cum_dminus_m = np.concatenate([[0.0], np.cumsum(dminus_step)])
+
+    profile = pd.DataFrame({
+        "km": grid / 1000,
+        "ele_m": ele_grid,
+        "cum_efd_km": cum_efd_m / 1000,
+        "cum_dplus_m": cum_dplus_m,
+        "cum_dminus_m": cum_dminus_m,
+    })
+
+    summary = {
+        "horizontal_distance_m": total_dist,
+        "d_plus_m": d_plus,
+        "d_minus_m": d_minus,
+        "efd_m": float(efd_m.sum()),
+    }
+    return summary, profile
+
+
+# ---------------------------------------------------------------------------
+# CACHED WRAPPERS
+# ---------------------------------------------------------------------------
+# These are the ONLY entry points the UI code below should call for parsing
+# .fit/.gpx files. Cache key = raw file bytes + the numeric params that
+# actually affect the output. As long as the user doesn't change the file
+# or those settings, any unrelated widget interaction elsewhere on the page
+# hits the cache instead of re-parsing/re-integrating from scratch.
+@st.cache_data(show_spinner="Elaborazione file .fit...")
+def load_and_process_fit(file_bytes: bytes, smooth_window: int,
+                          resample_step_m: float, zones: tuple):
+    """Parse + process a training .fit file. Returns a status dict."""
+    df_points = parse_fit(io.BytesIO(file_bytes))
+    if len(df_points) < 2:
+        return {"status": "invalid"}
+    if df_points["hr"].isna().all():
+        return {"status": "no_hr"}
+    segments, summary = process_track(df_points, smooth_window, resample_step_m, zones)
+    if segments is None:
+        return {"status": "degenerate"}
+    return {"status": "ok", "segments": segments, "summary": summary}
+
+
+@st.cache_data(show_spinner="Elaborazione percorso gara...")
+def load_and_process_race(file_bytes: bytes, ext: str, smooth_window: int,
+                           resample_step_m: float):
+    """Parse + process a race-course .gpx or .fit file. Returns (summary, profile) or (None, None)."""
+    if ext == "gpx":
+        df_race = parse_gpx(io.BytesIO(file_bytes))
+    else:
+        df_full = parse_fit(io.BytesIO(file_bytes))
+        df_race = df_full[["lat", "lon", "ele"]] if not df_full.empty else df_full
+
+    if df_race is None or len(df_race) < 2:
+        return None, None
+
+    return compute_race_efd(df_race, smooth_window, resample_step_m)
+
 
 # ---------------------------------------------------------------------------
 # UI
@@ -326,19 +556,19 @@ per_file_segments = {}     # filename -> segments dataframe (needed for Lap Anal
 for uploaded in uploaded_files:
     st.header(f"📄 {uploaded.name}")
 
-    df_points = parse_fit(io.BytesIO(uploaded.getvalue()))
-    if len(df_points) < 2:
+    result = load_and_process_fit(uploaded.getvalue(), smooth_window, resample_step, zones)
+
+    if result["status"] == "invalid":
         st.error("Traccia non valida: mancano punti GPS/timestamp validi in questo file.")
         continue
-    if df_points["hr"].isna().all():
+    if result["status"] == "no_hr":
         st.warning("⚠️ Nessun dato di frequenza cardiaca trovato in questo file: impossibile assegnare le zone.")
         continue
-
-    segments, summary = process_track(df_points, smooth_window, resample_step, zones)
-    if segments is None:
+    if result["status"] == "degenerate":
         st.error("Impossibile calcolare la distanza percorsa (traccia degenere).")
         continue
 
+    segments, summary = result["segments"], result["summary"]
     per_file_segments[uploaded.name] = segments
 
     c1, c2, c3 = st.columns(3)
@@ -400,11 +630,13 @@ if included:
             continue
         total_time_min = zdf["Tempo (min)"].sum()
         total_efd_km = zdf["EFD (km)"].sum()
+        max_time_min = zdf["Tempo (min)"].max()  # massimo in un singolo file
         # media pesata: EFS = EFD totale / tempo totale (non media delle medie)
         efs_weighted = (total_efd_km / (total_time_min / 60)) if total_time_min > 0 else np.nan
         summary_rows.append({
             "Zona": z,
             "Tempo totale (min)": int(round(total_time_min)),
+            "Durata massima (min)": int(round(max_time_min)),
             "EFD totale (km)": total_efd_km,
             "EFS media (km/h)": efs_weighted,
             "N. file": len(zdf),
@@ -412,6 +644,9 @@ if included:
 
     final_summary = pd.DataFrame(summary_rows)
     st.session_state['final_summary_df'] = final_summary
+    st.session_state['max_minutes_by_zone'] = dict(
+        zip(final_summary["Zona"], final_summary["Durata massima (min)"])
+    )
     st.dataframe(
         final_summary.style.format({
             "EFD totale (km)": "{:.2f}",
@@ -429,90 +664,7 @@ if included:
 elif per_file_zone_tables:
     st.info(f"Tutti i file caricati sono più corti di {MIN_FILE_DURATION_S // 60} minuti: nessun riepilogo finale calcolato.")
 
-# ---------------------------------------------------------------------------
-# GPX parsing (nessuna dipendenza esterna, solo xml.etree della stdlib)
-# ---------------------------------------------------------------------------
-def parse_gpx(file_obj) -> pd.DataFrame:
-    """Estrae lat, lon, elevazione da un file GPX (percorso gara, no HR/tempo)."""
-    tree = ET.parse(file_obj)
-    root = tree.getroot()
-    ns_uri = root.tag.split('}')[0].strip('{') if root.tag.startswith('{') else ''
- 
-    def tag(name):
-        return f'{{{ns_uri}}}{name}' if ns_uri else name
- 
-    rows = []
-    for trkpt in root.iter(tag('trkpt')):
-        lat_attr = trkpt.get('lat')
-        lon_attr = trkpt.get('lon')
-        if lat_attr is None or lon_attr is None:
-            continue
-        ele_el = trkpt.find(tag('ele'))
-        ele = float(ele_el.text) if ele_el is not None and ele_el.text else np.nan
-        rows.append((float(lat_attr), float(lon_attr), ele))
- 
-    df = pd.DataFrame(rows, columns=["lat", "lon", "ele"])
-    if df.empty:
-        return df
-    df["ele"] = df["ele"].ffill().bfill().fillna(0.0)
-    return df
- 
- 
-# ---------------------------------------------------------------------------
-# Calcolo EFD totale di un percorso (nessuna HR/zona richiesta)
-# ---------------------------------------------------------------------------
-def compute_race_efd(df: pd.DataFrame, smooth_window: int, resample_step_m: float):
-    """
-    Calcola EFD totale (m), distanza orizzontale, D+/D- per un percorso gara.
-    Ritorna (summary, profile) dove profile è un DataFrame con la mappa
-    km percorso (distanza orizzontale cumulata, "km" reali) -> EFD cumulato
-    (in km), usata poi dal Race Plan (sezione 5) per convertire un punto
-    del percorso nel corrispondente EFD accumulato.
-    """
-    lat, lon, ele = df["lat"].to_numpy(), df["lon"].to_numpy(), df["ele"].to_numpy()
- 
-    ele_smooth = (pd.Series(ele)
-                  .rolling(window=smooth_window, center=True, min_periods=1)
-                  .mean()
-                  .to_numpy())
- 
-    seg_dist = haversine_vec(lat[:-1], lon[:-1], lat[1:], lon[1:])
-    cum_dist = np.concatenate([[0.0], np.cumsum(seg_dist)])
-    total_dist = cum_dist[-1]
-    if total_dist <= 0:
-        return None, None
- 
-    n_steps = max(2, int(total_dist // resample_step_m))
-    grid = np.linspace(0.0, total_dist, n_steps)
-    ele_grid = np.interp(grid, cum_dist, ele_smooth)
- 
-    dx = np.diff(grid)
-    dz = np.diff(ele_grid)
-    dist3d = np.hypot(dx, dz)
-    slope = np.divide(dz, dx, out=np.zeros_like(dz), where=dx > 0)
- 
-    cost = cost_of_running(slope)
-    energy = cost * dist3d
-    efd_m = energy / FLAT_COST
- 
-    d_plus = float(dz[dz > 0].sum())
-    d_minus = float(-dz[dz < 0].sum())
 
-    cum_efd_m = np.concatenate([[0.0], np.cumsum(efd_m)])
-    profile = pd.DataFrame({
-        "km": grid / 1000,
-        "cum_efd_km": cum_efd_m / 1000,
-    })
- 
-    summary = {
-        "horizontal_distance_m": total_dist,
-        "d_plus_m": d_plus,
-        "d_minus_m": d_minus,
-        "efd_m": float(efd_m.sum()),
-    }
-    return summary, profile
- 
- 
 # ===========================================================
 # UI — Previsione Tempo Gara
 # ===========================================================
@@ -539,26 +691,35 @@ if race_files:
     ext = selected_race_file.name.rsplit(".", 1)[-1].lower()
 
     try:
-        if ext == "gpx":
-            df_race = parse_gpx(io.BytesIO(selected_race_file.getvalue()))
+        race_summary, race_profile = load_and_process_race(
+            selected_race_file.getvalue(), ext, smooth_window, resample_step
+        )
+        if race_summary is None:
+            st.error("⚠️ Traccia gara non valida o degenere: mancano punti GPS sufficienti.")
         else:
-            df_race_full = parse_fit(io.BytesIO(selected_race_file.getvalue()))
-            df_race = df_race_full[["lat", "lon", "ele"]] if not df_race_full.empty else df_race_full
+            st.session_state["race_efd_m"] = race_summary["efd_m"]
+            st.session_state["race_profile"] = race_profile
+            st.session_state["race_total_km"] = race_summary["horizontal_distance_m"] / 1000
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Distanza orizzontale", f"{race_summary['horizontal_distance_m']/1000:.2f} km")
+            c2.metric("D+ / D−", f"{race_summary['d_plus_m']:.0f} m / {race_summary['d_minus_m']:.0f} m")
+            c3.metric("EFD totale gara", f"{race_summary['efd_m']/1000:.2f} km")
 
-        if df_race is None or len(df_race) < 2:
-            st.error("⚠️ Traccia gara non valida: mancano punti GPS sufficienti.")
-        else:
-            race_summary, race_profile = compute_race_efd(df_race, smooth_window, resample_step)
-            if race_summary is None:
-                st.error("⚠️ Impossibile calcolare l'EFD per questo percorso (traccia degenere).")
+            _race_efd_km = race_summary["efd_m"] / 1000
+            _centers = sorted(BUCKET_CENTERS_KM.items(), key=lambda kv: kv[1])
+            if _race_efd_km <= _centers[0][1]:
+                st.caption(f"📐 Modello decadimento: curva bucket «{_centers[0][0]}» (nessun bucket più corto disponibile).")
+            elif _race_efd_km >= _centers[-1][1]:
+                st.caption(f"📐 Modello decadimento: curva bucket «{_centers[-1][0]}» (nessun bucket più lungo disponibile).")
             else:
-                st.session_state["race_efd_m"] = race_summary["efd_m"]
-                st.session_state["race_profile"] = race_profile
-                st.session_state["race_total_km"] = race_summary["horizontal_distance_m"] / 1000
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Distanza orizzontale", f"{race_summary['horizontal_distance_m']/1000:.2f} km")
-                c2.metric("D+ / D−", f"{race_summary['d_plus_m']:.0f} m / {race_summary['d_minus_m']:.0f} m")
-                c3.metric("EFD totale gara", f"{race_summary['efd_m']/1000:.2f} km")
+                for (n_lo, c_lo), (n_hi, c_hi) in zip(_centers[:-1], _centers[1:]):
+                    if c_lo <= _race_efd_km <= c_hi:
+                        w_hi = (_race_efd_km - c_lo) / (c_hi - c_lo)
+                        st.caption(
+                            f"📐 Modello decadimento: interpolazione {(1-w_hi)*100:.0f}% «{n_lo}» "
+                            f"+ {w_hi*100:.0f}% «{n_hi}»."
+                        )
+                        break
     except Exception as e:
         st.error(f"⚠️ Errore durante la lettura del file gara: {e}")
 
@@ -622,6 +783,24 @@ st.divider()
 # --- 3. Vincoli orari per zona -------------------------------------------
 st.subheader("3️⃣ Vincoli orari per zona (Z2 - Z5)")
 
+max_minutes_by_zone = st.session_state.get("max_minutes_by_zone")
+if max_minutes_by_zone:
+    st.caption(
+        "📏 Minutaggio massimo per sessione"
+        "(considerati i file caricati per l'analisi):"
+    )
+    max_rows = [
+        {"Zona": z, "Durata massima (min)": max_minutes_by_zone[z]}
+        for z in ["Z1", "Z2", "Z3", "Z4", "Z5"]
+        if z in max_minutes_by_zone
+    ]
+    st.dataframe(pd.DataFrame(max_rows), use_container_width=True, hide_index=True)
+else:
+    st.caption(
+        "ℹ️ Carica ed elabora i file di allenamento più in alto per vedere qui i minutaggi "
+        "massimi per zona registrati dall'atleta."
+    )
+
 PRESET_VALUES = {
     "Cauto":        {"t_z2": 0.0, "t_z3": 0.0, "t_z4": 0.0, "t_z5": 0.0},
     "Conservativo": {"t_z2": 0.0, "t_z3": 0.0, "t_z4": 0.0, "t_z5": 0.0},
@@ -637,6 +816,8 @@ def render_profile_selector(key_prefix: str, title: str | None = None):
     Disegna il selettore di profilo + slider per un singolo profilo di gara.
     key_prefix distingue i session_state key (es. "race", "race_a", "race_b")
     così più profili possono coesistere in pagina senza sovrascriversi.
+    Gli slider sono in minuti in UI, ma la funzione ritorna sempre le ore
+    (t_z2, t_z3, t_z4, t_z5), unità usata dal resto del calcolo.
     Ritorna: t_z2, t_z3, t_z4, t_z5, use_cauto, preset
     """
     if title:
@@ -655,10 +836,10 @@ def render_profile_selector(key_prefix: str, title: str | None = None):
     last_preset_key = f"_last_{key_prefix}_preset"
     if st.session_state.get(last_preset_key) != preset:
         if preset in PRESET_VALUES:
-            st.session_state[f"{key_prefix}_t_z2"] = PRESET_VALUES[preset]["t_z2"]
-            st.session_state[f"{key_prefix}_t_z3"] = PRESET_VALUES[preset]["t_z3"]
-            st.session_state[f"{key_prefix}_t_z4"] = PRESET_VALUES[preset]["t_z4"]
-            st.session_state[f"{key_prefix}_t_z5"] = PRESET_VALUES[preset]["t_z5"]
+            st.session_state[f"{key_prefix}_t_z2"] = int(round(PRESET_VALUES[preset]["t_z2"] * 60))
+            st.session_state[f"{key_prefix}_t_z3"] = int(round(PRESET_VALUES[preset]["t_z3"] * 60))
+            st.session_state[f"{key_prefix}_t_z4"] = int(round(PRESET_VALUES[preset]["t_z4"] * 60))
+            st.session_state[f"{key_prefix}_t_z5"] = int(round(PRESET_VALUES[preset]["t_z5"] * 60))
         st.session_state[last_preset_key] = preset
 
     if preset == "Conservativo":
@@ -670,10 +851,12 @@ def render_profile_selector(key_prefix: str, title: str | None = None):
         )
 
     col1, col2, col3, col4 = st.columns(4)
-    t_z2 = col1.slider("Ore in Zona 2", min_value=0.0, max_value=15.0, step=0.25, key=f"{key_prefix}_t_z2")
-    t_z3 = col2.slider("Ore in Zona 3", min_value=0.0, max_value=15.0, step=0.25, key=f"{key_prefix}_t_z3")
-    t_z4 = col3.slider("Ore in Zona 4", min_value=0.0, max_value=15.0, step=0.25, key=f"{key_prefix}_t_z4")
-    t_z5 = col4.slider("Ore in Zona 5", min_value=0.0, max_value=15.0, step=0.25, key=f"{key_prefix}_t_z5")
+    t_z2_min = col1.slider("Minuti in Zona 2", min_value=0, max_value=900, step=15, key=f"{key_prefix}_t_z2")
+    t_z3_min = col2.slider("Minuti in Zona 3", min_value=0, max_value=900, step=15, key=f"{key_prefix}_t_z3")
+    t_z4_min = col3.slider("Minuti in Zona 4", min_value=0, max_value=900, step=15, key=f"{key_prefix}_t_z4")
+    t_z5_min = col4.slider("Minuti in Zona 5", min_value=0, max_value=900, step=15, key=f"{key_prefix}_t_z5")
+
+    t_z2, t_z3, t_z4, t_z5 = t_z2_min / 60, t_z3_min / 60, t_z4_min / 60, t_z5_min / 60
 
     use_cauto = (preset == "Cauto")
     return t_z2, t_z3, t_z4, t_z5, use_cauto, preset
@@ -939,11 +1122,58 @@ else:
                     def cum_efd_at_km(km_value):
                         return float(np.interp(km_value, race_profile["km"], race_profile["cum_efd_km"]))
 
+                    def cum_dplus_at_km(km_value):
+                        return float(np.interp(km_value, race_profile["km"], race_profile["cum_dplus_m"]))
+
+                    def cum_dminus_at_km(km_value):
+                        return float(np.interp(km_value, race_profile["km"], race_profile["cum_dminus_m"]))
+
+                    LAP_COLORS = [
+                        "#1f4e79", "#f2c14e", "#8fb339", "#c1440e",
+                        "#5b8c85", "#a05195", "#2a9d8f", "#e76f51",
+                    ]
+
+                    def plot_elevation_profile_with_laps(race_profile: pd.DataFrame, laps_df: pd.DataFrame):
+                        """Profilo altimetrico del percorso con ciascun segmento del Race Plan
+                        evidenziato con una banda colorata e il proprio nome."""
+                        fig, ax = plt.subplots(figsize=(10, 3.2))
+                        ax.plot(race_profile["km"], race_profile["ele_m"], color="#333333", linewidth=1.2, zorder=3)
+                        ax.fill_between(
+                            race_profile["km"], race_profile["ele_m"], race_profile["ele_m"].min(),
+                            color="#333333", alpha=0.08, zorder=1,
+                        )
+
+                        ele_min = race_profile["ele_m"].min()
+                        ele_max = race_profile["ele_m"].max()
+                        y_span = max(ele_max - ele_min, 1.0)
+                        label_y = ele_max + 0.06 * y_span
+
+                        for i, lap in laps_df.iterrows():
+                            color = LAP_COLORS[i % len(LAP_COLORS)]
+                            ax.axvspan(lap["start_km"], lap["end_km"], color=color, alpha=0.22, zorder=0)
+                            ax.axvline(lap["start_km"], color=color, alpha=0.5, linewidth=0.8, zorder=2)
+                            mid_km = (lap["start_km"] + lap["end_km"]) / 2
+                            ax.text(
+                                mid_km, label_y, lap["name"], ha="center", va="bottom",
+                                fontsize=8, rotation=0, color=color, fontweight="bold",
+                            )
+
+                        ax.set_xlabel("Distanza (km)")
+                        ax.set_ylabel("Quota (m)")
+                        ax.set_ylim(ele_min - 0.05 * y_span, label_y + 0.12 * y_span)
+                        ax.set_xlim(race_profile["km"].min(), race_profile["km"].max())
+                        ax.spines["top"].set_visible(False)
+                        ax.spines["right"].set_visible(False)
+                        fig.tight_layout()
+                        return fig
+
                     def build_plan_for_profile(result, label):
                         """
                         Per ciascun lap:
-                          - e = EFD cumulato (valore assoluto) al km di ARRIVO del lap
-                          - ΔEFS(%) dall'equazione cubica (Minetti/decadence fit)
+                          - efd_pct = EFD cumulato a fine lap, in % dell'EFD totale gara
+                          - ΔEFS(%) previsto tramite predict_delta_efs_blended, che
+                            interpola tra i bucket di lunghezza gara più vicini (evita
+                            salti bruschi tra bucket adiacenti)
                           - EFS lap = baseline_efs * (1 + ΔEFS%/100), baseline_efs =
                             EFD totale gara / tempo di gara previsto (EFS media pesata
                             del profilo)
@@ -952,15 +1182,19 @@ else:
                         modo che la somma torni esatta al tempo di gara previsto.
                         """
                         baseline_efs = result["total_efd_km"] / result["race_time_h"]
+                        total_efd_km_race = result["total_efd_km"]
                         rows = []
                         raw_times_h = []
                         for _, lap in laps_df.iterrows():
                             efd_start = cum_efd_at_km(lap["start_km"])
                             efd_end = cum_efd_at_km(lap["end_km"])
                             efd_lap_km = max(efd_end - efd_start, 0.0)
-                            e = abs(efd_end)  # EFD accumulato a fine lap
+                            e = abs(efd_end)  # EFD accumulato a fine lap (km)
+                            efd_pct = (e / total_efd_km_race * 100.0) if total_efd_km_race > 0 else 0.0
                             dist_lap_km = lap["end_km"] - lap["start_km"]
-                            delta_pct = (38.204 - 1.2831 * e + 0.01336 * e**2 - 0.000047 * e**3)
+                            dplus_lap_m = cum_dplus_at_km(lap["end_km"]) - cum_dplus_at_km(lap["start_km"])
+                            dminus_lap_m = cum_dminus_at_km(lap["end_km"]) - cum_dminus_at_km(lap["start_km"])
+                            delta_pct = predict_delta_efs_blended(efd_pct, total_efd_km_race)
                             efs_lap = baseline_efs * (1 + delta_pct / 100)
                             if efs_lap <= 0:
                                 efs_lap = baseline_efs * 0.05  # floor di sicurezza
@@ -971,8 +1205,11 @@ else:
                                 "Km partenza": lap["start_km"],
                                 "Km arrivo": lap["end_km"],
                                 "Distanza (km)": dist_lap_km,
+                                "D+ (m)": dplus_lap_m,
+                                "D- (m)": dminus_lap_m,
                                 "EFD lap (km)": efd_lap_km,
                                 "EFD accumulato (km)": e,
+                                "EFD accumulato (%)": efd_pct,
                                 "EFS lap (km/h)": efs_lap,
                             })
 
@@ -1002,12 +1239,14 @@ else:
                         })
                         st.caption(f"Fattore di calibrazione applicato: ×{calib:.3f}")
                         display_cols = ["Lap", "Km partenza", "Km arrivo", "Distanza (km)",
+                                         "D+ (m)", "D- (m)",
                                          "Velocità (km/h)",
                                          "Tempo segmento", "Tempo di gara"]
                         st.dataframe(
                             plan_df[display_cols].style.format({
                                 "Km partenza": "{:.2f}", "Km arrivo": "{:.2f}",
                                 "Distanza (km)": "{:.2f}",
+                                "D+ (m)": "{:.0f}", "D- (m)": "{:.0f}",
                                 "Velocità (km/h)": "{:.1f}"
                             }),
                             use_container_width=True, hide_index=True,
@@ -1018,6 +1257,8 @@ else:
                             file_name="race_plan.csv",
                             mime="text/csv",
                         )
+
+                        st.pyplot(plot_elevation_profile_with_laps(race_profile, laps_df))
                     else:
                         result_a = st.session_state.get("result_a")
                         result_b = st.session_state.get("result_b")
@@ -1027,7 +1268,7 @@ else:
                         plan_a, calib_a = build_plan_for_profile(result_a, label_a)
                         plan_b, calib_b = build_plan_for_profile(result_b, label_b)
 
-                        merged = plan_a[["Lap", "Km partenza", "Km arrivo", "Distanza (km)"]].copy()
+                        merged = plan_a[["Lap", "Km partenza", "Km arrivo", "Distanza (km)", "D+ (m)", "D- (m)"]].copy()
                         merged[f"Velocità ({label_a}) km/h"] = plan_a["Velocità (km/h)"]
                         merged[f"Tempo segmento ({label_a})"] = plan_a[f"Tempo segmento ({label_a})"]
                         merged[f"Tempo di gara ({label_a})"] = plan_a[f"Tempo di gara ({label_a})"]
@@ -1044,6 +1285,7 @@ else:
                                 "Km partenza": "{:.2f}", 
                                 "Km arrivo": "{:.2f}",
                                 "Distanza (km)": "{:.2f}",
+                                "D+ (m)": "{:.0f}", "D- (m)": "{:.0f}",
                                 f"Velocità ({label_a}) km/h": "{:.1f}",
                                 f"Velocità ({label_b}) km/h": "{:.1f}",
                             }),
@@ -1055,3 +1297,5 @@ else:
                             file_name="race_plan_confronto.csv",
                             mime="text/csv",
                         )
+
+                        st.pyplot(plot_elevation_profile_with_laps(race_profile, laps_df))

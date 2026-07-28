@@ -893,12 +893,15 @@ def compute_race_time(t_z2, t_z3, t_z4, t_z5, zone_efs_ref, race_efd_m, use_caut
     capped = False
     capped_zone = None
     breakdown = []
+    time_used_h_total = 0.0  # tempo EFFETTIVAMENTE speso in Z2-Z5 (puo' essere < somma dei t_h impostati se si tronca)
 
     # Si procede dalla zona più alta (Z5) alla più bassa (Z2), sottraendo
     # via via l'EFD "consumata" da ciascun vincolo orario. Se in un
     # qualunque momento l'EFD residua andrebbe sotto zero, si tronca
-    # quella zona a ciò che resta e ci si ferma (le zone successive
-    # -incluse eventuali zone più basse e la Zona 1- non ricevono EFD).
+    # quella zona al tempo effettivamente necessario a coprire l'EFD
+    # rimasta (non al tempo pieno richiesto dall'utente) e ci si ferma:
+    # le zone successive (incluse eventuali zone più basse e la Zona 1)
+    # non ricevono EFD né tempo.
     for zname in ["Z5", "Z4", "Z3", "Z2"]:
         t_h = zone_times_h[zname]
         efs = zone_efs_ref.get(zname)
@@ -909,11 +912,16 @@ def compute_race_time(t_z2, t_z3, t_z4, t_z5, zone_efs_ref, race_efd_m, use_caut
         contrib_km = t_h * (efs or 0.0)
 
         if remaining_efd_km - contrib_km <= 0:
+            efd_covered = remaining_efd_km
+            # tempo davvero necessario a coprire l'EFD residua a questo EFS,
+            # NON il t_h pieno impostato dall'utente
+            time_used_h = (efd_covered / efs) if (efs and efs > 0) else 0.0
             breakdown.append({
-                "Zona": zname, "Tempo (h)": t_h,
-                "EFD coperta (km)": round(remaining_efd_km, 2),
+                "Zona": zname, "Tempo (h)": time_used_h,
+                "EFD coperta (km)": round(efd_covered, 2),
             })
             remaining_efd_km = 0.0
+            time_used_h_total += time_used_h
             capped = True
             capped_zone = zname
             break
@@ -923,6 +931,7 @@ def compute_race_time(t_z2, t_z3, t_z4, t_z5, zone_efs_ref, race_efd_m, use_caut
                 "EFD coperta (km)": round(contrib_km, 2),
             })
             remaining_efd_km -= contrib_km
+            time_used_h_total += t_h
 
     efs_z1 = zone_efs_ref.get("Z1")
     if efs_z1 is None or efs_z1 <= 0:
@@ -931,7 +940,7 @@ def compute_race_time(t_z2, t_z3, t_z4, t_z5, zone_efs_ref, race_efd_m, use_caut
     efs_z1_used = efs_z1 * CAUTO_Z1_FACTOR if use_cauto else efs_z1
 
     time_z1_h = (remaining_efd_km / efs_z1_used) if remaining_efd_km > 0 else 0.0
-    race_time_h = time_z1_h + t_z2 + t_z3 + t_z4 + t_z5
+    race_time_h = time_z1_h + time_used_h_total
 
     return {
         "error": None,
@@ -945,16 +954,14 @@ def compute_race_time(t_z2, t_z3, t_z4, t_z5, zone_efs_ref, race_efd_m, use_caut
         "total_efd_km": total_efd_km,
     }
 
-
 def display_result(result, label: str | None = None):
     suffix = f" — {label}" if label else ""
     st.metric(f"⏱️ Tempo di gara previsto{suffix}", seconds_to_hhmm(result["race_time_h"] * 3600))
 
     if result["capped"]:
         st.warning(
-            f"⚠️ I vincoli orari inseriti richiedono più EFD di quanta ne offra il percorso "
-            f"gara: la {result['capped_zone']} è stata troncata e la Zona 1 non contribuisce "
-            f"(tempo = 0h). Il profilo scelto non è sostenibile su questa distanza."
+            f"⚠️ La somma dei vincoli orari inseriti supera il tempo di gara totale previsto. "
+            f"La {result['capped_zone']} è stata utilizzata solo parzialmente e la Zona 1 non contribuisce "
         )
 
     with st.expander(f"Dettaglio calcolo{suffix}"):

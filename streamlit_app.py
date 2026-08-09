@@ -55,6 +55,8 @@ import streamlit as st
 import matplotlib.pyplot as plt
 from fitparse import FitFile
 import xml.etree.ElementTree as ET
+import warnings
+import fitdecode
 
 st.set_page_config(page_title="FIT — EFD/EFS per zona FC", layout="wide")
 
@@ -169,25 +171,37 @@ def seconds_to_hhmm(seconds) -> str:
 # .fit / .gpx parsing (pure functions — no Streamlit calls inside, so they
 # are safe to call from cached wrappers below)
 # ---------------------------------------------------------------------------
+
 def parse_fit(file_obj) -> pd.DataFrame:
-    """Extract lat, lon, elevation, heart rate, elapsed time (s) per record."""
-    fitfile = FitFile(file_obj)
+    """Extract lat, lon, elevation, heart rate, elapsed time (s) per record.
+
+    Uses fitdecode instead of fitparse: some devices (e.g. COROS) write
+    malformed field-size declarations in definition messages (typically in
+    developer-data fields). fitparse treats this as fatal and aborts the
+    whole file; fitdecode logs a warning and skips just that field, so the
+    rest of the file still parses normally.
+    """
     rows = []
-    for record in fitfile.get_messages("record"):
-        data = {f.name: f.value for f in record}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=UserWarning)
+        with fitdecode.FitReader(file_obj) as fit:
+            for frame in fit:
+                if frame.frame_type != fitdecode.FIT_FRAME_DATA or frame.name != "record":
+                    continue
+                data = {f.name: f.value for f in frame.fields}
 
-        lat_raw = data.get("position_lat")
-        lon_raw = data.get("position_long")
-        if lat_raw is None or lon_raw is None:
-            continue
+                lat_raw = data.get("position_lat")
+                lon_raw = data.get("position_long")
+                if lat_raw is None or lon_raw is None:
+                    continue
 
-        lat = lat_raw * SEMICIRCLE_TO_DEG
-        lon = lon_raw * SEMICIRCLE_TO_DEG
-        ele = data.get("enhanced_altitude", data.get("altitude"))
-        hr = data.get("heart_rate")
-        ts = data.get("timestamp")
+                lat = lat_raw * SEMICIRCLE_TO_DEG
+                lon = lon_raw * SEMICIRCLE_TO_DEG
+                ele = data.get("enhanced_altitude", data.get("altitude"))
+                hr = data.get("heart_rate")
+                ts = data.get("timestamp")
 
-        rows.append((lat, lon, ele, hr, ts))
+                rows.append((lat, lon, ele, hr, ts))
 
     df = pd.DataFrame(rows, columns=["lat", "lon", "ele", "hr", "timestamp"])
     df = df.dropna(subset=["lat", "lon", "timestamp"]).reset_index(drop=True)
@@ -196,7 +210,7 @@ def parse_fit(file_obj) -> pd.DataFrame:
         return df
 
     df["ele"] = df["ele"].astype(float).ffill().bfill().fillna(0.0)
-    df["hr"] = df["hr"].astype(float)  # may contain NaN, handled later
+    df["hr"] = df["hr"].astype(float)
     df["elapsed_s"] = (df["timestamp"] - df["timestamp"].iloc[0]).dt.total_seconds()
     return df
 

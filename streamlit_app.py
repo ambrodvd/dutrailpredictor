@@ -741,25 +741,42 @@ race_efd_m = st.session_state.get("race_efd_m")
 
 st.divider()
 
-# --- 2. Dati EFS di riferimento -----------------------------------------
-st.subheader("2️⃣ Dati EFS di riferimento (allenamento)")
+# --- 2. Dati di riferimento: EFS + minutaggi massimi per zona -----------
+st.subheader("2️⃣ Dati di riferimento (EFS + minutaggi massimi per zona)")
 
 efs_source = st.radio(
-    "Fonte EFS per zona:",
-    ["Usa il riepilogo calcolato in questa sessione", "Importa CSV riepilogo EFS"],
+    "Fonte dati di riferimento:",
+    ["Usa il riepilogo calcolato in questa sessione", "Importa CSV riepilogo"],
     key="efs_source_race",
 )
 
 zone_efs_ref = {}
+max_minutes_by_zone = {}
 
 if efs_source == "Usa il riepilogo calcolato in questa sessione":
     final_summary_df = st.session_state.get("final_summary_df")
     if final_summary_df is not None and not final_summary_df.empty:
         for _, row in final_summary_df.iterrows():
             zone_efs_ref[row["Zona"]] = float(row["EFS media (km/h)"])
+            max_minutes_by_zone[row["Zona"]] = float(row["Durata massima (min)"])
         st.success(
-            "✅ EFS di riferimento: " +
-            ", ".join(f"{z} = {v:.2f} km/h" for z, v in zone_efs_ref.items())
+            "✅ I dati di riferimento per il calcolo della previsione sono quelli calcolati in questa sessione"
+        )
+
+        ref_export_df = pd.DataFrame([
+            {
+                "Zona": z,
+                "EFS media (km/h)": zone_efs_ref[z],
+                "Durata massima (min)": max_minutes_by_zone[z],
+            }
+            for z in ["Z1", "Z2", "Z3", "Z4", "Z5"] if z in zone_efs_ref
+        ])
+        st.download_button(
+            label="📥 Scarica dati di riferimento (EFS + minutaggi) in CSV",
+            data=ref_export_df.to_csv(index=False).encode('utf-8'),
+            file_name="riferimento_efs_minutaggi.csv",
+            mime='text/csv',
+            key="dl_ref_efs_minutaggi",
         )
     else:
         st.warning(
@@ -767,41 +784,46 @@ if efs_source == "Usa il riepilogo calcolato in questa sessione":
             "più in alto nella pagina, oppure importa un CSV."
         )
 else:
-    uploaded_efs_csv = st.file_uploader(
-        "Carica CSV riepilogo EFS per zona (colonne: Zona, EFS media (km/h))",
+    uploaded_ref_csv = st.file_uploader(
+        "Carica CSV riferimento (colonne: Zona, EFS media (km/h), Durata massima (min))",
         type=["csv"],
         key="efs_ref_csv",
     )
-    if uploaded_efs_csv is not None:
+    if uploaded_ref_csv is not None:
         try:
-            ref_df = pd.read_csv(uploaded_efs_csv)
+            ref_df = pd.read_csv(uploaded_ref_csv)
             zona_col = next((c for c in ref_df.columns if c.strip().lower() == "zona"), None)
             efs_col = next((c for c in ref_df.columns if "efs" in c.lower()), None)
+            max_col = next(
+                (c for c in ref_df.columns if "durata" in c.lower() or "massim" in c.lower()), None
+            )
             if zona_col is None or efs_col is None:
                 st.error(
-                    "⚠️ Il CSV deve contenere una colonna 'Zona' e una colonna EFS "
-                    "(es. 'EFS media (km/h)')."
+                    "⚠️ Il CSV deve contenere almeno una colonna 'Zona' e una colonna EFS "
+                    "(es. 'EFS media (km/h)'). La colonna 'Durata massima (min)' è opzionale."
                 )
             else:
                 for _, row in ref_df.iterrows():
                     zone_efs_ref[row[zona_col]] = float(row[efs_col])
-                st.success(
-                    "✅ EFS di riferimento importate: " +
-                    ", ".join(f"{z} = {v:.2f} km/h" for z, v in zone_efs_ref.items())
+                    if max_col is not None and pd.notna(row[max_col]):
+                        max_minutes_by_zone[row[zona_col]] = float(row[max_col])
+                msg = "✅ Dati di riferimento importati: " + ", ".join(
+                    f"{z} = {v:.2f} km/h" for z, v in zone_efs_ref.items()
                 )
+                if max_col is None:
+                    msg += " (nessuna colonna di minutaggio massimo trovata nel CSV: sezione 3 vuota)"
+                st.success(msg)
         except Exception as e:
             st.error(f"⚠️ Errore durante la lettura del CSV: {e}")
 
 st.divider()
 
 # --- 3. Vincoli orari per zona -------------------------------------------
-st.subheader("3️⃣ Vincoli orari per zona (Z2 - Z5)")
+st.subheader("3️⃣ Tempi massimi per zona (Z1 - Z5)")
 
-max_minutes_by_zone = st.session_state.get("max_minutes_by_zone")
 if max_minutes_by_zone:
     st.caption(
-        "📏 Minutaggio massimo per sessione"
-        "(considerati i file caricati per l'analisi):"
+        "📏 Minutaggio massimo per zona, in base alla fonte dati selezionata al punto 2️⃣:"
     )
     max_rows = [
         {"Zona": z, "Durata massima (min)": max_minutes_by_zone[z]}
@@ -811,9 +833,14 @@ if max_minutes_by_zone:
     st.dataframe(pd.DataFrame(max_rows), use_container_width=True, hide_index=True)
 else:
     st.caption(
-        "ℹ️ Carica ed elabora i file di allenamento più in alto per vedere qui i minutaggi "
-        "massimi per zona registrati dall'atleta."
+        "ℹ️ Nessun minutaggio massimo disponibile: carica ed elabora i file di allenamento più in "
+        "alto nella pagina, oppure importa un CSV che includa la colonna 'Durata massima (min)'."
     )
+
+st.divider()
+
+# --- 4. Selezione profilo -------------------------------------------
+st.subheader("4️⃣ Seleziona il profilo di corsa dell'atleta")
 
 PRESET_VALUES = {
     "Cauto":        {"t_z2": 0.0, "t_z3": 0.0, "t_z4": 0.0, "t_z5": 0.0},
@@ -825,21 +852,34 @@ PRESET_VALUES = {
 CAUTO_Z1_FACTOR = 0.9  # EFS Zona 1 ridotta del 10% quando il profilo è "Cauto"
 
 
-def render_profile_selector(key_prefix: str, title: str | None = None):
+ZONE_SLIDER_SPECS = [
+    ("Z2", "t_z2", "Minuti in Zona 2"),
+    ("Z3", "t_z3", "Minuti in Zona 3"),
+    ("Z4", "t_z4", "Minuti in Zona 4"),
+    ("Z5", "t_z5", "Minuti in Zona 5"),
+]
+
+
+def render_profile_selector(key_prefix: str, title: str | None = None,
+                             max_minutes_by_zone: dict | None = None):
     """
     Disegna il selettore di profilo + slider per un singolo profilo di gara.
     key_prefix distingue i session_state key (es. "race", "race_a", "race_b")
     così più profili possono coesistere in pagina senza sovrascriversi.
     Gli slider sono in minuti in UI, ma la funzione ritorna sempre le ore
     (t_z2, t_z3, t_z4, t_z5), unità usata dal resto del calcolo.
+    max_minutes_by_zone (opzionale, da sezione 2️⃣/3️⃣) alimenta sia il preset
+    "Massimo" sia il bottone "Massimo" affiancato a ciascuno slider.
     Ritorna: t_z2, t_z3, t_z4, t_z5, use_cauto, preset
     """
     if title:
         st.markdown(f"**{title}**")
 
+    max_minutes_by_zone = max_minutes_by_zone or {}
+
     preset = st.radio(
         "Profilo di gara:",
-        ["Cauto", "Conservativo", "Coraggioso", "Competitivo", "Personalizzato"],
+        ["Cauto", "Conservativo", "Coraggioso", "Competitivo", "Massimo", "Personalizzato"],
         horizontal=True,
         key=f"{key_prefix}_profile_preset",
     )
@@ -854,6 +894,13 @@ def render_profile_selector(key_prefix: str, title: str | None = None):
             st.session_state[f"{key_prefix}_t_z3"] = int(round(PRESET_VALUES[preset]["t_z3"] * 60))
             st.session_state[f"{key_prefix}_t_z4"] = int(round(PRESET_VALUES[preset]["t_z4"] * 60))
             st.session_state[f"{key_prefix}_t_z5"] = int(round(PRESET_VALUES[preset]["t_z5"] * 60))
+        elif preset == "Massimo":
+            # Zona 1 esclusa di proposito: il tempo in Z1 non è un vincolo
+            # orario impostabile, è ciò che resta dopo aver coperto Z2-Z5.
+            for zona, state_suffix, _ in ZONE_SLIDER_SPECS:
+                st.session_state[f"{key_prefix}_{state_suffix}"] = int(
+                    round(max_minutes_by_zone.get(zona, 0))
+                )
         st.session_state[last_preset_key] = preset
 
     if preset == "Conservativo":
@@ -863,14 +910,34 @@ def render_profile_selector(key_prefix: str, title: str | None = None):
             "ℹ️ L'atleta correrà unicamente in Zona 1, con EFS Zona 1 ridotta del "
             f"{int((1 - CAUTO_Z1_FACTOR) * 100)}% per margine di sicurezza"
         )
+    elif preset == "Massimo":
+        if max_minutes_by_zone:
+            st.info("ℹ️ Ogni zona (Z2-Z5) è impostata al minutaggio massimo registrato dall'atleta.")
+        else:
+            st.warning(
+                "⚠️ Nessun minutaggio massimo disponibile (sezione 2️⃣/3️⃣ vuota): gli slider "
+                "restano a 0. Carica dei file .fit o importa un CSV di riferimento."
+            )
 
-    col1, col2, col3, col4 = st.columns(4)
-    t_z2_min = col1.slider("Minuti in Zona 2", min_value=0, max_value=900, step=15, key=f"{key_prefix}_t_z2")
-    t_z3_min = col2.slider("Minuti in Zona 3", min_value=0, max_value=900, step=15, key=f"{key_prefix}_t_z3")
-    t_z4_min = col3.slider("Minuti in Zona 4", min_value=0, max_value=900, step=15, key=f"{key_prefix}_t_z4")
-    t_z5_min = col4.slider("Minuti in Zona 5", min_value=0, max_value=900, step=15, key=f"{key_prefix}_t_z5")
+    cols = st.columns(4)
+    minutes_by_zone = {}
+    for (zona, state_suffix, label), col in zip(ZONE_SLIDER_SPECS, cols):
+        state_key = f"{key_prefix}_{state_suffix}"
+        max_min = max_minutes_by_zone.get(zona)
 
-    t_z2, t_z3, t_z4, t_z5 = t_z2_min / 60, t_z3_min / 60, t_z4_min / 60, t_z5_min / 60
+        if col.button(f"⏫ Massimo {zona}", key=f"{state_key}_max_btn",
+                      disabled=(max_min is None), use_container_width=True):
+            st.session_state[state_key] = int(round(max_min))
+
+        slider_max = max(900, int(round(max_min)) if max_min else 0)
+        minutes_by_zone[zona] = col.slider(
+            label, min_value=0, max_value=slider_max, step=15, key=state_key
+        )
+
+    t_z2, t_z3, t_z4, t_z5 = (
+        minutes_by_zone["Z2"] / 60, minutes_by_zone["Z3"] / 60,
+        minutes_by_zone["Z4"] / 60, minutes_by_zone["Z5"] / 60,
+    )
 
     use_cauto = (preset == "Cauto")
     return t_z2, t_z3, t_z4, t_z5, use_cauto, preset
@@ -879,18 +946,24 @@ def render_profile_selector(key_prefix: str, title: str | None = None):
 compare_mode = st.checkbox("🔀 Confronta due profili (calcola un range)", key="race_compare_mode")
 
 if not compare_mode:
-    t_z2, t_z3, t_z4, t_z5, use_cauto, preset = render_profile_selector("race")
+    t_z2, t_z3, t_z4, t_z5, use_cauto, preset = render_profile_selector(
+        "race", max_minutes_by_zone=max_minutes_by_zone
+    )
 else:
     col_a, col_b = st.columns(2)
     with col_a:
-        t_z2_a, t_z3_a, t_z4_a, t_z5_a, use_cauto_a, preset_a = render_profile_selector("race_a", "Profilo A")
+        t_z2_a, t_z3_a, t_z4_a, t_z5_a, use_cauto_a, preset_a = render_profile_selector(
+            "race_a", "Profilo A", max_minutes_by_zone=max_minutes_by_zone
+        )
     with col_b:
-        t_z2_b, t_z3_b, t_z4_b, t_z5_b, use_cauto_b, preset_b = render_profile_selector("race_b", "Profilo B")
+        t_z2_b, t_z3_b, t_z4_b, t_z5_b, use_cauto_b, preset_b = render_profile_selector(
+            "race_b", "Profilo B", max_minutes_by_zone=max_minutes_by_zone
+        )
 
 st.divider()
 
-# --- 4. Calcolo previsione -----------------------------------------------
-st.subheader("4️⃣ Previsione tempo gara")
+# --- 5. Calcolo previsione -----------------------------------------------
+st.subheader("5️⃣ Previsione tempo gara")
 
 
 def compute_race_time(t_z2, t_z3, t_z4, t_z5, zone_efs_ref, race_efd_m, use_cauto):

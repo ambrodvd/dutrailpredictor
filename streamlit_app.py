@@ -805,8 +805,100 @@ per_file_segments = {}     # filename -> segments dataframe (needed for Lap Anal
 
 fit_uploads = expand_uploads(uploaded_files, accept=("fit",))
 
+# --- esclusione manuale di singoli file ------------------------------------
+# I nomi prodotti da expand_uploads sono deterministici a parità di upload,
+# quindi si possono usare come identificativo stabile tra un rerun e l'altro.
+if "excluded_fit_files" not in st.session_state:
+    st.session_state["excluded_fit_files"] = set()
+excluded_files = st.session_state["excluded_fit_files"]
+
+# Ripulisce i nomi non più presenti tra i file caricati: senza questo, un
+# file rimosso e ricaricato più tardi resterebbe escluso a sorpresa.
+excluded_files &= {name for name, _b, _e in fit_uploads}
+
+active_uploads = [u for u in fit_uploads if u[0] not in excluded_files]
+
+
+# --- controllo duplicati ----------------------------------------------------
+def find_duplicate_groups(uploads, tolerance_s: int = 120):
+    """Raggruppa i file la cui partenza dista meno di `tolerance_s` secondi e
+    restituisce solo i gruppi con più di un file.
+
+    Due export della stessa attività — es. lo stesso allenamento scaricato sia
+    da Garmin sia da TrainingPeaks — hanno bytes diversi ma partenza a pochi
+    secondi di distanza (il ricampionamento o il trim possono spostare il primo
+    record), quindi il confronto va fatto sulla data e con una tolleranza, non
+    sull'hash del file.
+
+    Si raggruppa per vicinanza e non arrotondando al minuto: due file a 06:45:29
+    e 06:45:31 distano 2 secondi ma cadrebbero in due minuti diversi, e il
+    duplicato sfuggirebbe. Due attività realmente distinte che partono a meno di
+    due minuti l'una dall'altra non esistono nella pratica."""
+    entries = []
+    for name, blob, _ext in uploads:
+        res = load_and_process_fit(blob, smooth_window, resample_step, zones)
+        if res.get("status") != "ok":
+            continue
+        start = res["summary"].get("start_time")
+        if start is None:
+            continue
+        entries.append((pd.Timestamp(start), name))
+
+    entries.sort(key=lambda e: e[0])
+
+    groups = {}
+    current = []
+    for ts, name in entries:
+        if current and (ts - current[-1][0]).total_seconds() <= tolerance_s:
+            current.append((ts, name))
+        else:
+            if len(current) > 1:
+                groups[current[0][0]] = [n for _t, n in current]
+            current = [(ts, name)]
+    if len(current) > 1:
+        groups[current[0][0]] = [n for _t, n in current]
+
+    return groups
+
+
+dup_groups = find_duplicate_groups(active_uploads) if len(active_uploads) > 1 else {}
+duplicated_names = {n for names in dup_groups.values() for n in names}
+
+if dup_groups:
+    dettaglio = "\n".join(
+        f"- **{format_date_it(start)}** → {', '.join(names)}"
+        for start, names in dup_groups.items()
+    )
+    st.warning(
+        "⚠️ **Possibili allenamenti duplicati.** Questi file hanno la stessa data e "
+        "ora di partenza, quindi con ogni probabilità sono la stessa attività "
+        "caricata più volte. Così com'è, ciascuno pesa due volte sul riepilogo "
+        "finale e sui minutaggi massimi per zona. Escludi i doppioni con il "
+        "bottone accanto al file.\n\n" + dettaglio
+    )
+
 for fit_name, fit_bytes, _fit_ext in fit_uploads:
-    st.header(f"📄 {fit_name}")
+    is_excluded = fit_name in excluded_files
+
+    head_col, btn_col = st.columns([5, 1])
+    with head_col:
+        st.header(f"📄 {fit_name}")
+    with btn_col:
+        if is_excluded:
+            if st.button("↩️ Reincludi", key=f"incl_{fit_name}",
+                         use_container_width=True):
+                excluded_files.discard(fit_name)
+                st.rerun()
+        else:
+            if st.button("🚫 Escludi", key=f"excl_{fit_name}",
+                         use_container_width=True):
+                excluded_files.add(fit_name)
+                st.rerun()
+
+    if is_excluded:
+        st.caption("⛔ File escluso dall'analisi e dal riepilogo finale.")
+        st.divider()
+        continue
 
     result = load_and_process_fit(fit_bytes, smooth_window, resample_step, zones)
 
@@ -828,6 +920,12 @@ for fit_name, fit_bytes, _fit_ext in fit_uploads:
         date_label = f"🗓️ {format_date_it(start_dt)}"
         if not summary.get("start_time_is_local", False):
             date_label += "  ·  ora UTC (il file non dichiara il fuso)"
+        if fit_name in duplicated_names:
+            gemelli = [
+                n for names in dup_groups.values() if fit_name in names
+                for n in names if n != fit_name
+            ]
+            date_label += f"  ·  ⚠️ stessa partenza di: {', '.join(gemelli)}"
         st.caption(date_label)
 
     c1, c2, c3 = st.columns(3)
@@ -872,6 +970,10 @@ excluded = [name for name, tbl, total_t in per_file_zone_tables if total_t < MIN
 
 if included:
     st.header("📊 Riepilogo finale (media tra i file)")
+    if excluded_files:
+        st.caption(
+            "File esclusi manualmente: " + ", ".join(sorted(excluded_files))
+        )
     if excluded:
         st.caption(
             f"File esclusi dalla media perché più corti di {MIN_FILE_DURATION_S // 60} minuti: "
@@ -1475,10 +1577,22 @@ else:
                         "#5b8c85", "#a05195", "#2a9d8f", "#e76f51",
                     ]
 
-                    def plot_elevation_profile_with_laps(race_profile: pd.DataFrame, laps_df: pd.DataFrame):
+                    # Colori dei tempi di passaggio: profilo A / profilo B.
+                    # Scelti scuri e distinti dai colori delle bande dei lap,
+                    # che sono al 22% di alpha e quindi molto chiari.
+                    PROFILE_TIME_COLORS = ["#11324d", "#8c2f0d"]
+
+                    def plot_elevation_profile_with_laps(race_profile: pd.DataFrame, laps_df: pd.DataFrame,
+                                                          time_labels=None, legend_labels=None):
                         """Profilo altimetrico del percorso con ciascun segmento del Race Plan
-                        evidenziato con una banda colorata e il proprio nome."""
-                        fig, ax = plt.subplots(figsize=(10, 3.2))
+                        evidenziato con una banda colorata e il proprio nome.
+
+                        time_labels (opzionale): lista lunga quanto laps_df, dove ogni voce
+                        è una lista di 1 o 2 stringhe — il tempo di gara cumulato a fine
+                        segmento, uno per profilo. Viene scritta in verticale sotto il
+                        confine di fine segmento. legend_labels dà i nomi dei profili
+                        corrispondenti (per la legenda dei colori)."""
+                        fig, ax = plt.subplots(figsize=(10, 4.2 if time_labels else 3.2))
                         ax.plot(race_profile["km"], race_profile["ele_m"], color="#333333", linewidth=1.2, zorder=3)
                         ax.fill_between(
                             race_profile["km"], race_profile["ele_m"], race_profile["ele_m"].min(),
@@ -1500,10 +1614,50 @@ else:
                                 fontsize=8, rotation=0, color=color, fontweight="bold",
                             )
 
+                        # --- tempi di gara ai confini di fine segmento ---
+                        # Testo ruotato di 90°: con molti segmenti le etichette
+                        # orizzontali si sovrapporrebbero. Con due profili si
+                        # scrivono due colonne affiancate, distinte per colore.
+                        bottom = ele_min - 0.05 * y_span
+                        if time_labels:
+                            x_span = race_profile["km"].max() - race_profile["km"].min()
+                            dx = 0.009 * x_span
+                            time_y = ele_min - 0.09 * y_span
+
+                            for i, lap in laps_df.iterrows():
+                                labels_i = time_labels[i]
+                                ax.axvline(lap["end_km"], color="#999999", alpha=0.6,
+                                           linewidth=0.7, linestyle=":", zorder=2)
+                                if len(labels_i) == 1:
+                                    offsets = [0.0]
+                                else:
+                                    offsets = [-dx, dx]
+                                for txt, off, col in zip(labels_i, offsets, PROFILE_TIME_COLORS):
+                                    ax.text(
+                                        lap["end_km"] + off, time_y, txt,
+                                        ha="center", va="top", fontsize=7,
+                                        rotation=90, color=col, fontweight="bold",
+                                    )
+
+                            bottom = ele_min - 0.45 * y_span
+
+                            if legend_labels and len(legend_labels) > 1:
+                                # sotto l'asse x: in alto si scontrerebbe con i
+                                # nomi dei segmenti
+                                for name, col in zip(legend_labels, PROFILE_TIME_COLORS):
+                                    ax.plot([], [], color=col, linewidth=3, label=name)
+                                ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16),
+                                          fontsize=8, frameon=False, ncol=len(legend_labels))
+
                         ax.set_xlabel("Distanza (km)")
                         ax.set_ylabel("Quota (m)")
-                        ax.set_ylim(ele_min - 0.05 * y_span, label_y + 0.12 * y_span)
-                        ax.set_xlim(race_profile["km"].min(), race_profile["km"].max())
+                        ax.set_ylim(bottom, label_y + 0.12 * y_span)
+                        # margine a destra: l'etichetta del tempo finale sta
+                        # esattamente sull'ultimo km e verrebbe tagliata a metà
+                        x_lo = race_profile["km"].min()
+                        x_hi = race_profile["km"].max()
+                        x_pad = 0.012 * (x_hi - x_lo) if time_labels else 0.0
+                        ax.set_xlim(x_lo, x_hi + x_pad)
                         ax.spines["top"].set_visible(False)
                         ax.spines["right"].set_visible(False)
                         fig.tight_layout()
@@ -1600,7 +1754,10 @@ else:
                             mime="text/csv",
                         )
 
-                        st.pyplot(plot_elevation_profile_with_laps(race_profile, laps_df))
+                        st.pyplot(plot_elevation_profile_with_laps(
+                            race_profile, laps_df,
+                            time_labels=[[t] for t in plan_df["Tempo di gara"]],
+                        ))
                     else:
                         result_a = st.session_state.get("result_a")
                         result_b = st.session_state.get("result_b")
@@ -1640,4 +1797,13 @@ else:
                             mime="text/csv",
                         )
 
-                        st.pyplot(plot_elevation_profile_with_laps(race_profile, laps_df))
+                        st.pyplot(plot_elevation_profile_with_laps(
+                            race_profile, laps_df,
+                            time_labels=[
+                                [ta, tb] for ta, tb in zip(
+                                    plan_a[f"Tempo di gara ({label_a})"],
+                                    plan_b[f"Tempo di gara ({label_b})"],
+                                )
+                            ],
+                            legend_labels=[label_a, label_b],
+                        ))

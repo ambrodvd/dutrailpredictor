@@ -1259,9 +1259,7 @@ with tab_training:
         )
         st.warning(
             "⚠️ **Possibili allenamenti duplicati.** Questi file hanno la stessa data e "
-            "ora di partenza, quindi con ogni probabilità sono la stessa attività "
-            "caricata più volte. Così com'è, ciascuno pesa due volte sul riepilogo "
-            "finale e sui minutaggi massimi per zona. Escludi i doppioni con il "
+            "ora di partenza. Escludi i doppioni con il "
             "bottone accanto al file.\n\n" + dettaglio
         )
 
@@ -1675,11 +1673,7 @@ with tab_race:
             "Nome del profilo",
             key=name_key,
             max_chars=40,
-            help="Puoi rinominare il profilo come preferisci (es. «Piano gara Gallo», "
-                 "«Prudente con caldo»). Il nome compare nei risultati, nelle colonne "
-                 "del race plan e nella legenda del profilo altimetrico. Cambiando "
-                 "preset il nome si aggiorna da solo, a meno che tu non l'abbia già "
-                 "personalizzato.",
+            help="Puoi rinominare il profilo come preferisci"
         )
         profile_name = (profile_name or "").strip() or preset
 

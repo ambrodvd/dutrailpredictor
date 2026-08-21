@@ -84,11 +84,16 @@ from fitparse import FitFile
 import xml.etree.ElementTree as ET
 import warnings
 import fitdecode
+import plotly.graph_objects as go
 
 st.set_page_config(page_title=" 🔮 DU Trail Predictor", layout="wide")
 
 MIN_FILE_DURATION_S = 10 * 60  # file sotto questa durata esclusi dal riepilogo finale
 
+# Soglie minime di file per abilitare modelli con più parametri (evita overfitting).
+# Usate da fit_candidates nella scheda 🆚 Confronto.
+MIN_FILES_FOR_QUADRATIC = 10
+MIN_FILES_FOR_CUBIC = 15
 
 # ---------------------------------------------------------------------------
 # Energy cost of running as a function of slope (Minetti et al. 2002)
@@ -211,6 +216,31 @@ def seconds_to_hhmm(seconds) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def hhmm_to_seconds(t):
+    """Converte 'HH:MM:SS' o 'MM:SS' in secondi. Non parsabile -> NaN.
+    Inverso di seconds_to_hhmm: serve a rileggere i tempi del race plan CSV."""
+    if pd.isna(t) or not isinstance(t, str) or not t.strip():
+        return np.nan
+    try:
+        parts = [int(p) for p in t.strip().split(":")]
+    except ValueError:
+        return np.nan
+    if len(parts) == 3:
+        h, m, s = parts
+    elif len(parts) == 2:
+        h, m, s = 0, parts[0], parts[1]
+    else:
+        return np.nan
+    return h * 3600 + m * 60 + s
+
+def slugify_name(text: str) -> str:
+    """'Davide Grazielli' -> 'Davide Grazielli'. Compone nomi file sicuri: tiene solo
+    alfanumerici, spazi, trattini e underscore, poi collassa gli spazi."""
+    cleaned = "".join(
+        ch if ch.isalnum() or ch in " -_" else "_" for ch in (text or "").strip()
+    )
+    return "_".join(cleaned.split()) or "report"
+
 # ---------------------------------------------------------------------------
 # Riconoscimento formato + espansione archivi .zip
 # ---------------------------------------------------------------------------
@@ -227,6 +257,8 @@ GZIP_MAGIC = b"\x1f\x8b"
 # Estensioni "di trasporto" da togliere dal nome quando si ricostruisce
 # un nome pulito: TrainingPeaks consegna tipicamente <id>.fit.gz.
 _STRIPPABLE_EXT = {"gz", "gzip", "zip", "fit", "gpx", "dat", "txt", "bin"}
+
+
 
 
 def gunzip_if_needed(data: bytes, max_depth: int = 3) -> bytes:
@@ -955,7 +987,7 @@ def build_race_plan_pdf(table_df: pd.DataFrame, chart_png: bytes | None,
     font_size = 8 if n_cols <= 8 else (7 if n_cols <= 11 else 6)
 
     # Larghezze proporzionali al contenuto dei DATI, non delle intestazioni:
-    # in modalità confronto le colonne tipo "Tempo di gara (Piano gara Gallo)"
+    # in modalità confronto le colonne tipo "Tempo di gara"
     # hanno intestazioni lunghissime e, pesandole, schiaccerebbero "D+ (m)"
     # sotto la larghezza della sua stessa intestazione. Le intestazioni vanno
     # invece a capo (sono Paragraph), con un minimo pari alla parola più
@@ -1009,6 +1041,86 @@ def build_race_plan_pdf(table_df: pd.DataFrame, chart_png: bytes | None,
 
 
 # ---------------------------------------------------------------------------
+# Fit di forme candidate (usato dalla scheda 🆚 Confronto)
+# ---------------------------------------------------------------------------
+# Stessa libreria di forme dell'app Speed Decadence: si fittano più equazioni
+# e si sceglie quella con adj. R² migliore. n_files limita i gradi di libertà
+# quando il campione è piccolo, perché i bin di uno stesso file NON sono
+# osservazioni indipendenti.
+def fit_candidates(x: np.ndarray, y: np.ndarray, n_files: int) -> dict:
+    n = len(x)
+    ss_tot = np.sum((y - y.mean()) ** 2)
+
+    def r2_of(pred):
+        ss_res = np.sum((y - pred) ** 2)
+        return 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+    def adj_r2_of(r2, k):
+        if n - k - 1 <= 0 or np.isnan(r2):
+            return np.nan
+        return 1 - (1 - r2) * (n - 1) / (n - k - 1)
+
+    candidates = {}
+
+    c = np.polyfit(x, y, 1)
+    pred = np.polyval(c, x)
+    r2 = r2_of(pred)
+    candidates["Lineare"] = {
+        "coefs": c, "k": 2, "r2": r2, "adj_r2": adj_r2_of(r2, 2),
+        "predict": lambda xx, c=c: np.polyval(c, xx),
+        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot p",
+    }
+
+    x_log = np.log1p(x)
+    c = np.polyfit(x_log, y, 1)
+    pred = np.polyval(c, x_log)
+    r2 = r2_of(pred)
+    candidates["Logaritmica"] = {
+        "coefs": c, "k": 2, "r2": r2, "adj_r2": adj_r2_of(r2, 2),
+        "predict": lambda xx, c=c: np.polyval(c, np.log1p(xx)),
+        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot \ln(p+1)",
+    }
+
+    x_sqrt = np.sqrt(x)
+    c = np.polyfit(x_sqrt, y, 1)
+    pred = np.polyval(c, x_sqrt)
+    r2 = r2_of(pred)
+    candidates["Radice quadrata"] = {
+        "coefs": c, "k": 2, "r2": r2, "adj_r2": adj_r2_of(r2, 2),
+        "predict": lambda xx, c=c: np.polyval(c, np.sqrt(xx)),
+        "equation": rf"\Delta EFS(\%) = {c[1]:.3f} + {c[0]:.4f} \cdot \sqrt{{p}}",
+    }
+
+    if n_files >= MIN_FILES_FOR_QUADRATIC:
+        c = np.polyfit(x, y, 2)
+        pred = np.polyval(c, x)
+        r2 = r2_of(pred)
+        candidates["Quadratica"] = {
+            "coefs": c, "k": 3, "r2": r2, "adj_r2": adj_r2_of(r2, 3),
+            "predict": lambda xx, c=c: np.polyval(c, xx),
+            "equation": rf"\Delta EFS(\%) = {c[2]:.3f} + {c[1]:.4f} \cdot p + {c[0]:.5f} \cdot p^2",
+        }
+
+    if n_files >= MIN_FILES_FOR_CUBIC:
+        c = np.polyfit(x, y, 3)
+        pred = np.polyval(c, x)
+        r2 = r2_of(pred)
+        candidates["Cubica"] = {
+            "coefs": c, "k": 4, "r2": r2, "adj_r2": adj_r2_of(r2, 4),
+            "predict": lambda xx, c=c: np.polyval(c, xx),
+            "equation": (rf"\Delta EFS(\%) = {c[3]:.3f} + {c[2]:.4f} \cdot p + "
+                         rf"{c[1]:.5f} \cdot p^2 + {c[0]:.6f} \cdot p^3"),
+        }
+
+    return candidates
+
+
+def best_candidate(candidates: dict):
+    return max(candidates, key=lambda k: (candidates[k]["adj_r2"]
+                                           if not np.isnan(candidates[k]["adj_r2"]) else -np.inf))
+
+
+# ---------------------------------------------------------------------------
 # CACHED WRAPPERS
 # ---------------------------------------------------------------------------
 # These are the ONLY entry points the UI code below should call for parsing
@@ -1041,6 +1153,19 @@ def load_and_process_fit(file_bytes: bytes, smooth_window: int,
     summary["start_time_is_local"] = offset_s is not None
 
     return {"status": "ok", "segments": segments, "summary": summary}
+
+
+@st.cache_data(show_spinner="Elaborazione gara reale...")
+def load_and_process_real_race(file_bytes: bytes, smooth_window: int,
+                                resample_step_m: float, zones: tuple):
+    """Parse + process del .fit della gara realmente corsa (scheda 🆚 Confronto).
+    A differenza di load_and_process_fit NON pretende dati cardiaci: qui servono
+    solo tempo, distanza ed EFD per segmento. Se l'HR manca, la colonna 'zone'
+    resta a None e nessuno la legge."""
+    df = parse_fit(io.BytesIO(file_bytes))
+    if df.empty or len(df) < 2:
+        return None, None
+    return process_track(df, smooth_window, resample_step_m, zones)
 
 
 @st.cache_data(show_spinner="Elaborazione percorso gara...")
@@ -1080,12 +1205,13 @@ st.caption(
 # gara -> race plan -> export. Non serve duplicare nulla in session_state per
 # il semplice passaggio di dati tra schede.
 
-tab_hr, tab_training, tab_race, tab_plan, tab_export = st.tabs([
+tab_hr, tab_training, tab_race, tab_plan, tab_export, tab_compare = st.tabs([
     "❤️ Zone FC",
     "📊 Allenamenti",
     "🎯 Gara e profilo",
     "🗺️ Race Plan",
     "📄 Export",
+    "🆚 Confronto",
 ])
 
 # --- File upload & processing settings ---
@@ -1114,14 +1240,6 @@ with tab_hr:
             st.session_state[zone] = val
 
     st.subheader("Zone cardiache dell'atleta")
-
-    st.text_input(
-        "Nome dell'atleta",
-        key="athlete_name",
-        max_chars=60,
-        placeholder="es. Mario Rossi",
-        help="Compare nel nome del CSV delle zone e nell'intestazione del report PDF.",
-    )
 
     st.markdown(':red[Imposta le zone cardiache per una corretta analisi degli allenamenti:]')
 
@@ -1173,18 +1291,21 @@ with tab_hr:
         - ❤️ Zona 5 (Sopra soglia): > {z4} bpm
         """)
 
-        athlete_name = st.session_state.get('athlete_name', 'atleta')
+        # Il campo "Nome dell'atleta" vive nella scheda 📄 Export: qui si legge
+        # soltanto, se già compilato, per intestare il CSV delle zone.
+        athlete_name = (st.session_state.get('athlete_name') or '').strip()
         export_df = pd.DataFrame([{
-            'athlete_name': athlete_name, 'z1': z1, 'z2': z2, 'z3': z3, 'z4': z4, 'z5': z5
+            'athlete_name': athlete_name or 'atleta',
+            'z1': z1, 'z2': z2, 'z3': z3, 'z4': z4, 'z5': z5
         }])
         csv_data = export_df.to_csv(index=False).encode('utf-8')
         st.download_button(
             label="📥 Esporta zone in CSV",
             data=csv_data,
-            file_name=f"{str(athlete_name).replace(' ', '_')}_HR_Zones.csv",
+            file_name=(f"{athlete_name.replace(' ', '_')}_HR_Zones.csv"
+                       if athlete_name else "HR_Zones.csv"),
             mime='text/csv'
         )
-
 
 
 with tab_training:
@@ -1334,13 +1455,6 @@ with tab_training:
                 use_container_width=True,
                 hide_index=True,
             )
-            st.download_button(
-                label="📥 Scarica tabella zone (CSV)",
-                data=zone_table.to_csv(index=False).encode('utf-8'),
-                file_name=f"{fit_name.rsplit('.', 1)[0]}_zone_efs.csv",
-                mime='text/csv',
-                key=f"dl_{fit_name}",
-            )
             per_file_zone_tables.append((fit_name, zone_table, summary["total_time_s"]))
 
         with st.expander("Dettaglio segmenti (debug)"):
@@ -1449,14 +1563,6 @@ with tab_race:
             if _cur in ("", _prev_stem):
                 st.session_state["race_name"] = selected_race_name.rsplit(".", 1)[0]
             st.session_state[_last_race_file_key] = selected_race_name
-
-        st.text_input(
-            "Nome della gara",
-            key="race_name",
-            max_chars=80,
-            placeholder="es. Gallo Scenic K120 2026",
-            help="Usato come titolo del report PDF.",
-        )
 
         try:
             race_summary, race_profile = load_and_process_race(
@@ -1669,13 +1775,13 @@ with tab_race:
                     )
             st.session_state[last_preset_key] = preset
 
-        profile_name = st.text_input(
-            "Nome del profilo",
-            key=name_key,
-            max_chars=40,
-            help="Puoi rinominare il profilo come preferisci"
-        )
-        profile_name = (profile_name or "").strip() or preset
+        # Il campo editabile vive nella scheda 📄 Export: qui si legge soltanto il
+        # valore in session_state. tab_export viene eseguita DOPO questa scheda
+        # nell'ordine dello script, quindi la scrittura sopra (nome che segue il
+        # preset) avviene sempre prima che il widget venga istanziato: nessun
+        # conflitto con la protezione di Streamlit sulle chiavi dei widget.
+        profile_name = (st.session_state.get(name_key) or "").strip() or preset
+        st.caption(f"Nome profilo: **{profile_name}** — rinominabile nella scheda 📄 Export.")
 
         if preset == "Conservativo":
             st.info("ℹ️ L'atleta correrà unicamente in Zona 1")
@@ -2104,19 +2210,54 @@ with tab_plan:
             }),
             use_container_width=True, hide_index=True,
         )
-        st.download_button(
-            "📥 Scarica race plan (CSV)",
-            data=plan_df[display_cols].to_csv(index=False).encode("utf-8"),
-            file_name=f"{plan_state['file_stem']}.csv",
-            mime="text/csv",
-            key="dl_race_plan_csv",
-        )
 
         st.image(plan_state["chart_png"], use_container_width=True)
 
-
 with tab_export:
     st.header("📄 Esporta il report")
+
+    # --- Intestazione ---------------------------------------------------------
+    # Questi campi stanno FUORI dal controllo su plan_state di proposito: i nomi
+    # dei profili vengono letti da render_profile_selector (scheda 🎯 Gara e
+    # profilo), che gira prima di questa, quindi devono essere compilabili anche
+    # quando un race plan non esiste ancora. Lo stesso vale per il nome atleta,
+    # usato anche dal CSV delle zone nella scheda ❤️ Zone FC.
+    st.subheader("Intestazione del report")
+
+    c_ath, c_race = st.columns(2)
+    c_ath.text_input(
+        "Nome dell'atleta *",
+        key="athlete_name",
+        max_chars=60,
+        placeholder="es. Davide Grazielli",
+        help="Obbligatorio: compare nell'intestazione del report e nel nome dei file.",
+    )
+    c_race.text_input(
+        "Nome della gara *",
+        key="race_name",
+        max_chars=80,
+        placeholder="es. UTMB 2026",
+        help="Obbligatorio: titolo del report e parte del nome dei file.",
+    )
+
+    _profile_help = (
+        "Il nome entra nelle colonne del piano: dopo averlo cambiato ricalcola "
+        "il race plan per vederlo aggiornato."
+    )
+    if st.session_state.get("race_compare_mode", False):
+        c_pa, c_pb = st.columns(2)
+        c_pa.text_input("Nome del profilo A", key="race_a_profile_name",
+                        max_chars=40, help=_profile_help)
+        c_pb.text_input("Nome del profilo B", key="race_b_profile_name",
+                        max_chars=40, help=_profile_help)
+    else:
+        st.text_input("Nome del profilo", key="race_profile_name",
+                      max_chars=40, help=_profile_help)
+
+    athlete = (st.session_state.get("athlete_name") or "").strip()
+    race_title = (st.session_state.get("race_name") or "").strip()
+
+    st.divider()
 
     plan_state = st.session_state.get("race_plan_data")
 
@@ -2125,9 +2266,40 @@ with tab_export:
             "ℹ️ Nessun race plan da esportare: costruiscine uno nella scheda "
             "**🗺️ Race Plan**."
         )
+    elif not athlete or not race_title:
+        mancanti = [
+            etichetta for etichetta, valore in
+            (("Nome dell'atleta", athlete), ("Nome della gara", race_title))
+            if not valore
+        ]
+        st.warning(
+            "⚠️ Compila i campi obbligatori per generare gli export: "
+            + ", ".join(f"**{m}**" for m in mancanti) + "."
+        )
     else:
         plan_df = plan_state["plan_df"]
         display_cols = plan_state["display_cols"]
+
+        # Nome file unico per CSV e PDF: atleta_gara_raceplan
+        file_stem = f"{slugify_name(athlete)}_{slugify_name(race_title)}_raceplan"
+
+        # --- CSV --------------------------------------------------------------
+        st.subheader("Dati (CSV)")
+        st.download_button(
+            "📥 Scarica race plan (CSV)",
+            data=plan_df[display_cols].to_csv(index=False).encode("utf-8"),
+            file_name=f"{file_stem}.csv",
+            mime="text/csv",
+            key="dl_race_plan_csv",
+        )
+        st.caption(
+            "Scarica il CSV per utilizzarlo in futuro per analisi e piani nutrizionali"
+        )
+
+        st.divider()
+
+        # --- PDF --------------------------------------------------------------
+        st.subheader("Report (PDF)")
 
         if not REPORTLAB_OK:
             st.warning(
@@ -2168,18 +2340,7 @@ with tab_export:
                      "Gli a capo vengono mantenuti.",
             )
 
-            race_title = (st.session_state.get("race_name") or "").strip()
-            athlete = (st.session_state.get("athlete_name") or "").strip()
-
-            if not race_title:
-                st.caption(
-                    "ℹ️ Nessun nome gara impostato nella scheda **🎯 Gara e profilo**: il report "
-                    "userà «Race Plan» come titolo."
-                )
-
-            pdf_meta = list(plan_state["meta"])
-            if athlete:
-                pdf_meta.insert(0, f"Atleta: {athlete}")
+            pdf_meta = [f"Atleta: {athlete}"] + list(plan_state["meta"])
 
             if not selected_cols:
                 st.info("Seleziona almeno una colonna per generare il PDF.")
@@ -2188,18 +2349,11 @@ with tab_export:
                     pdf_bytes = build_race_plan_pdf(
                         table_df=format_plan_for_export(plan_df[selected_cols]),
                         chart_png=plan_state["chart_png"] if include_chart else None,
-                        title=race_title or "Race Plan",
+                        title=race_title,
                         meta_lines=pdf_meta,
                         comment=coach_comment,
                         note=plan_state["calib_caption"],
                     )
-                    file_stem = plan_state["file_stem"]
-                    if race_title:
-                        safe = "".join(
-                            ch if ch.isalnum() or ch in " -_" else "_"
-                            for ch in race_title
-                        ).strip().replace(" ", "_")
-                        file_stem = f"{safe}_{file_stem}"
                     st.download_button(
                         "📄 Scarica Race Plan (PDF)",
                         data=pdf_bytes,
@@ -2210,3 +2364,317 @@ with tab_export:
                     )
                 except Exception as e:
                     st.error(f"⚠️ Errore durante la generazione del PDF: {e}")
+
+with tab_compare:
+    st.header("🆚 Confronto Race Plan previsto vs Gara reale")
+    st.caption(
+        "Carica il race plan esportato dalla scheda **📄 Export** (CSV) e il file .fit della "
+        "gara realmente corsa: confronta i tempi di passaggio previsti vs reali ai lap, e lo "
+        "scostamento EFS realmente osservato in gara rispetto alla curva teorica che ha "
+        "generato il piano."
+    )
+
+    bin_width_pct = st.slider(
+        "Ampiezza fetta (% dell'EFD totale della gara)",
+        1.0, 20.0, 5.0, step=1.0, key="compare_bin_width",
+    )
+    st.caption(
+        "Il decadimento si analizza per fette di EFD **relativo** (% del totale della gara), "
+        "la stessa scala su cui è calibrata la curva del modello."
+    )
+
+    col_up1, col_up2 = st.columns(2)
+    with col_up1:
+        plan_csv = st.file_uploader(
+            "📋 Race plan previsto (CSV esportato dalla scheda Export)",
+            type=["csv"], key="compare_plan_csv",
+        )
+    with col_up2:
+        real_fit_files = st.file_uploader(
+            "🏁 File .fit della gara realmente corsa",
+            type=["fit", "gz", "zip"], accept_multiple_files=False,
+            key="compare_real_fit",
+        )
+
+    real_uploads = expand_uploads(
+        [real_fit_files] if real_fit_files is not None else [], accept=("fit",)
+    )
+
+    if plan_csv is not None and real_uploads:
+        _real_name, real_bytes, _real_ext = real_uploads[0]
+
+        try:
+            plan_df_cmp = pd.read_csv(plan_csv)
+        except Exception as e:
+            st.error(f"⚠️ Errore nella lettura del CSV: {e}")
+            plan_df_cmp = None
+
+        if plan_df_cmp is not None:
+            # Il nome del profilo tra parentesi varia (Competitivo, Profilo A...),
+            # e in modalità singola la colonna è semplicemente "Tempo di gara":
+            # in entrambi i casi startswith("Tempo di gara") intercetta tutto.
+            tempo_gara_cols = [c for c in plan_df_cmp.columns if c.startswith("Tempo di gara")]
+            required_base_cols = {"Lap", "Km partenza", "Km arrivo", "Distanza (km)"}
+            missing = required_base_cols - set(plan_df_cmp.columns)
+
+            if missing or not tempo_gara_cols:
+                st.error(
+                    "⚠️ Il CSV non sembra un race plan valido. "
+                    + (f"Colonne mancanti: {missing}. " if missing else "")
+                    + ("Nessuna colonna 'Tempo di gara (...)' trovata." if not tempo_gara_cols else "")
+                )
+            else:
+                if len(tempo_gara_cols) > 1:
+                    tempo_gara_col = st.selectbox(
+                        "Più profili trovati nel CSV: quale usare come riferimento?",
+                        tempo_gara_cols, key="tempo_gara_col_select",
+                    )
+                else:
+                    tempo_gara_col = tempo_gara_cols[0]
+
+                try:
+                    segments_real, summary_real = load_and_process_real_race(
+                        real_bytes, smooth_window, resample_step, zones
+                    )
+                except Exception as e:
+                    st.error(f"⚠️ File .fit illeggibile o corrotto: {e}")
+                    segments_real = None
+
+                if segments_real is None:
+                    st.error("⚠️ Nessun dato GPS valido nel file .fit della gara reale (traccia degenere).")
+                else:
+                    cum_km_real = segments_real["distance_km"].to_numpy()
+                    cum_t_real = np.cumsum(segments_real["dt_s"].to_numpy())
+                    total_efd_real_km = float(segments_real["efd_m"].sum() / 1000)
+                    total_time_real_s = float(cum_t_real[-1])
+                    total_km_real = float(cum_km_real[-1])
+
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Distanza reale", f"{total_km_real:.2f} km")
+                    c2.metric("EFD reale", f"{total_efd_real_km:.2f} km")
+                    c3.metric("Tempo reale totale", seconds_to_hhmm(total_time_real_s))
+
+                    # --- tabella di confronto ai lap ---
+                    rows_cmp = []
+                    prev_t_prev_s, prev_t_real_s = 0.0, 0.0
+                    for _, lap in plan_df_cmp.iterrows():
+                        km_end = float(lap["Km arrivo"])
+                        t_prev_s = hhmm_to_seconds(lap[tempo_gara_col])
+
+                        if km_end <= total_km_real:
+                            t_real_s = float(np.interp(km_end, cum_km_real, cum_t_real))
+                            oltre_percorso = False
+                        else:
+                            # l'atleta non ha (ancora) raggiunto questo km nel file reale
+                            t_real_s = np.nan
+                            oltre_percorso = True
+
+                        delta_s = (t_real_s - t_prev_s) if not np.isnan(t_real_s) else np.nan
+                        seg_prev_s = t_prev_s - prev_t_prev_s
+                        seg_real_s = (t_real_s - prev_t_real_s) if not np.isnan(t_real_s) else np.nan
+
+                        rows_cmp.append({
+                            "Lap": lap["Lap"],
+                            "Km arrivo": km_end,
+                            "Tempo previsto (cum.)": seconds_to_hhmm(t_prev_s),
+                            "Tempo reale (cum.)": seconds_to_hhmm(t_real_s) if not oltre_percorso else "—",
+                            "Δ cumulato": (
+                                f"{'+' if delta_s >= 0 else '−'}{seconds_to_hhmm(abs(delta_s))}"
+                                if not np.isnan(delta_s) else "—"
+                            ),
+                            "Tempo segmento previsto": seconds_to_hhmm(seg_prev_s),
+                            "Tempo segmento reale": seconds_to_hhmm(seg_real_s) if not oltre_percorso else "—",
+                            "_delta_s": delta_s,
+                        })
+                        prev_t_prev_s = t_prev_s
+                        if not oltre_percorso:
+                            prev_t_real_s = t_real_s
+
+                    cmp_table = pd.DataFrame(rows_cmp)
+
+                    st.subheader("📋 Tempi di passaggio: previsto vs reale")
+                    display_cmp = cmp_table.drop(columns=["_delta_s"])
+                    st.dataframe(display_cmp, use_container_width=True, hide_index=True)
+                    st.download_button(
+                        "📥 Scarica confronto (CSV)",
+                        data=display_cmp.to_csv(index=False).encode("utf-8"),
+                        file_name="confronto_race_plan_vs_reale.csv",
+                        mime="text/csv",
+                        key="dl_confronto_csv",
+                    )
+
+                    valid_delta = cmp_table.dropna(subset=["_delta_s"])
+                    if not valid_delta.empty:
+                        final_delta_s = valid_delta["_delta_s"].iloc[-1]
+                        if final_delta_s > 0:
+                            st.warning(
+                                f"🐢 L'atleta è arrivato **{seconds_to_hhmm(final_delta_s)} più lento** "
+                                "del previsto (all'ultimo lap raggiunto)."
+                            )
+                        elif final_delta_s < 0:
+                            st.success(
+                                f"🚀 L'atleta è arrivato **{seconds_to_hhmm(abs(final_delta_s))} più veloce** "
+                                "del previsto (all'ultimo lap raggiunto)."
+                            )
+                        else:
+                            st.info("⏱️ Tempo esattamente in linea con la previsione.")
+
+                        gap_min = valid_delta["_delta_s"].to_numpy() / 60.0
+                        x_gap = valid_delta["Km arrivo"].to_numpy()
+                        lap_names_gap = valid_delta["Lap"].to_numpy()
+                        delta_s_gap = valid_delta["_delta_s"].to_numpy()
+                        bar_labels = [
+                            f"{'+' if s >= 0 else '−'}{seconds_to_hhmm(abs(s))}" for s in delta_s_gap
+                        ]
+                        bar_colors = ["#c1440e" if v >= 0 else "#2a9d8f" for v in gap_min]
+
+                        fig_gap = go.Figure()
+                        fig_gap.add_trace(go.Bar(
+                            x=x_gap,
+                            y=gap_min,
+                            marker_color=bar_colors,
+                            text=bar_labels,
+                            textposition="outside",
+                            customdata=lap_names_gap,
+                            hovertemplate=(
+                                "<b>%{customdata}</b><br>Km %{x:.1f}<br>Scarto: %{text}<extra></extra>"
+                            ),
+                        ))
+                        fig_gap.add_hline(y=0, line_color="#333333", line_width=1)
+                        fig_gap.update_layout(
+                            title="Scarto cumulato: tempo reale vs tempo previsto",
+                            xaxis_title="Km",
+                            yaxis_title="Scarto (min)",
+                            showlegend=False,
+                            height=420,
+                            margin=dict(t=60, b=40, l=40, r=20),
+                            uniformtext_minsize=10,
+                        )
+                        st.caption("🟠 rosso = più lento del previsto · 🟢 verde = più veloce del previsto")
+                        st.plotly_chart(fig_gap, use_container_width=True)
+
+                    # --- modello teorico vs decadimento osservato ---
+                    st.divider()
+                    st.subheader("📐 Decadimento EFS: modello teorico vs gara reale")
+                    st.caption(
+                        "EFD accumulato in % del totale della gara reale, scostamento dell'EFS di "
+                        "fetta rispetto all'EFS medio dell'INTERA gara reale, sovrapposto alla curva "
+                        "del modello a bucket (`predict_delta_efs_blended`) — la stessa che ha "
+                        "generato i tempi di passaggio del piano."
+                    )
+
+                    if total_time_real_s <= 0 or total_efd_real_km <= 0:
+                        st.info("Dati reali insufficienti per calcolare il decadimento.")
+                    else:
+                        dt_arr_r = segments_real["dt_s"].to_numpy()
+                        efd_arr_r = segments_real["efd_m"].to_numpy()
+                        avg_efs_real_ms = efd_arr_r.sum() / dt_arr_r.sum()
+
+                        cum_efd_before_r = np.cumsum(efd_arr_r) - efd_arr_r
+                        mid_efd_r = cum_efd_before_r + efd_arr_r / 2.0
+                        efd_pct_arr_r = mid_efd_r / efd_arr_r.sum() * 100.0
+                        bin_idx_r = (efd_pct_arr_r // bin_width_pct).astype(int)
+
+                        bin_df_r = pd.DataFrame({"bin_idx": bin_idx_r, "dt_s": dt_arr_r, "efd_m": efd_arr_r})
+                        grouped_r = bin_df_r.groupby("bin_idx", as_index=False).sum()
+                        grouped_r = grouped_r[grouped_r["dt_s"] > 0]
+
+                        real_decadence_rows = []
+                        for _, row in grouped_r.iterrows():
+                            bin_efs_ms_r = row["efd_m"] / row["dt_s"]
+                            dev_pct_r = (bin_efs_ms_r - avg_efs_real_ms) / avg_efs_real_ms * 100.0
+                            efd_pct_center_r = (row["bin_idx"] + 0.5) * bin_width_pct
+                            real_decadence_rows.append({
+                                "efd_pct_accum": efd_pct_center_r,
+                                "deviation_pct_reale": dev_pct_r,
+                            })
+                        real_decadence_df = pd.DataFrame(real_decadence_rows)
+
+                        x_line_r = np.linspace(0, 100, 200)
+                        theoretical_line_r = np.array([
+                            predict_delta_efs_blended(p, total_efd_real_km) for p in x_line_r
+                        ])
+
+                        fig3 = go.Figure()
+                        fig3.add_trace(go.Scatter(
+                            x=x_line_r, y=theoretical_line_r, mode="lines",
+                            name=f"Teorica (modello, {total_efd_real_km:.0f} km EFD)",
+                            line=dict(color="#1f4e79", width=3),
+                        ))
+                        fig3.add_trace(go.Scatter(
+                            x=real_decadence_df["efd_pct_accum"],
+                            y=real_decadence_df["deviation_pct_reale"],
+                            mode="markers", name="Reale (fette di gara)",
+                            marker=dict(size=9, color="#c1440e"),
+                        ))
+
+                        # Fit esplorativo sui punti di QUESTA gara. n_files è forzato
+                        # a MIN_FILES_FOR_CUBIC per sbloccare tutte le forme: non è il
+                        # vero numero di file indipendenti (è 1), ma qui si vuole
+                        # lasciare al fit la libertà di descrivere la forma osservata.
+                        real_best_fit = None
+                        if len(real_decadence_df) >= 6:
+                            real_fit_candidates = fit_candidates(
+                                real_decadence_df["efd_pct_accum"].to_numpy(),
+                                real_decadence_df["deviation_pct_reale"].to_numpy(),
+                                n_files=MIN_FILES_FOR_CUBIC,
+                            )
+                            real_best_name = best_candidate(real_fit_candidates)
+                            real_best_fit = real_fit_candidates[real_best_name]
+                            real_fitted_line = real_best_fit["predict"](x_line_r)
+
+                            fig3.add_trace(go.Scatter(
+                                x=x_line_r, y=real_fitted_line, mode="lines",
+                                name=f"Fit reale — {real_best_name}",
+                                line=dict(color="#c1440e", width=2, dash="dash"),
+                            ))
+
+                        fig3.add_hline(y=0, line_dash="dash", line_color="gray")
+                        fig3.update_layout(
+                            title="Modello del piano vs decadimento realmente osservato",
+                            xaxis_title="EFD accumulato (% della gara reale)",
+                            yaxis_title="Scostamento EFS (%)",
+                            height=450,
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                        )
+                        st.plotly_chart(fig3, use_container_width=True)
+
+                        if real_best_fit is not None:
+                            st.caption(
+                                f"Equazione fittata sui dati reali di questa gara — "
+                                f"miglior candidato: **{real_best_name}** "
+                                f"(R² = {real_best_fit['r2']:.3f} · adj. R² = {real_best_fit['adj_r2']:.3f}). "
+                                "Con un solo file i bin non sono osservazioni indipendenti: leggi il fit "
+                                "come descrizione della forma osservata in QUESTA gara, non come modello "
+                                "statisticamente robusto — un adj. R² molto alto è spesso solo "
+                                "overfitting sui pochi punti disponibili."
+                            )
+                            st.latex(real_best_fit["equation"])
+                            with st.expander("Vedi tutte le equazioni candidate fittate sui dati reali"):
+                                ranked_real = sorted(
+                                    real_fit_candidates.items(),
+                                    key=lambda kv: (kv[1]["adj_r2"] if not np.isnan(kv[1]["adj_r2"]) else -np.inf),
+                                    reverse=True,
+                                )
+                                for cname, c in ranked_real:
+                                    star = " 🏆 **migliore**" if cname == real_best_name else ""
+                                    st.markdown(f"{cname}{star}")
+                                    st.latex(c["equation"])
+                                    st.caption(f"R² = {c['r2']:.3f} · adj. R² = {c['adj_r2']:.3f}")
+                        else:
+                            st.caption(
+                                "Troppo pochi bin per fittare un'equazione affidabile sui dati reali "
+                                "(servono almeno 6 fette: riduci l'ampiezza fetta o carica un file più lungo)."
+                            )
+
+                        with st.expander("Dati decadimento reale (debug/export)"):
+                            st.dataframe(real_decadence_df, use_container_width=True, hide_index=True)
+                            st.download_button(
+                                "📥 Scarica decadimento reale (CSV)",
+                                data=real_decadence_df.to_csv(index=False).encode("utf-8"),
+                                file_name="decadimento_efs_reale.csv",
+                                mime="text/csv",
+                                key="dl_decadimento_reale_csv",
+                            )
+    elif plan_csv is not None or real_fit_files is not None:
+        st.info("Carica sia il CSV del race plan sia il file .fit della gara reale per procedere.")

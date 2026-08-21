@@ -5,3 +5,4 @@ plotly
 fitparse
 matplotlib.pyplot
 reportlab
+Plotly

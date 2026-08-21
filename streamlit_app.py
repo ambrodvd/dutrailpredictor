@@ -1220,7 +1220,9 @@ def render_profile_selector(key_prefix: str, title: str | None = None,
     (t_z2, t_z3, t_z4, t_z5), unità usata dal resto del calcolo.
     max_minutes_by_zone (opzionale, da sezione 2️⃣/3️⃣) alimenta sia il preset
     "Massimo" sia il bottone "Massimo" affiancato a ciascuno slider.
-    Ritorna: t_z2, t_z3, t_z4, t_z5, use_cauto, preset
+    Ritorna: t_z2, t_z3, t_z4, t_z5, use_cauto, preset, profile_name
+    (preset è il nome tecnico che governa la logica, profile_name è
+    l'etichetta scelta dall'utente e usata solo per la visualizzazione)
     """
     if title:
         st.markdown(f"**{title}**")
@@ -1238,7 +1240,17 @@ def render_profile_selector(key_prefix: str, title: str | None = None,
     # comunque modificare gli slider liberamente dopo la selezione (anche in
     # "Personalizzato", dove semplicemente non si sovrascrive nulla).
     last_preset_key = f"_last_{key_prefix}_preset"
-    if st.session_state.get(last_preset_key) != preset:
+    name_key = f"{key_prefix}_profile_name"
+    prev_preset = st.session_state.get(last_preset_key)
+
+    if prev_preset != preset:
+        # Il nome segue il preset finché l'utente non lo personalizza: se il
+        # nome corrente è ancora quello del preset precedente (o è vuoto) lo
+        # si aggiorna, altrimenti si rispetta quello scritto a mano.
+        current_name = (st.session_state.get(name_key) or "").strip()
+        if current_name in ("", prev_preset or ""):
+            st.session_state[name_key] = preset
+
         if preset in PRESET_VALUES:
             st.session_state[f"{key_prefix}_t_z2"] = int(round(PRESET_VALUES[preset]["t_z2"] * 60))
             st.session_state[f"{key_prefix}_t_z3"] = int(round(PRESET_VALUES[preset]["t_z3"] * 60))
@@ -1252,6 +1264,18 @@ def render_profile_selector(key_prefix: str, title: str | None = None,
                     round(max_minutes_by_zone.get(zona, 0))
                 )
         st.session_state[last_preset_key] = preset
+
+    profile_name = st.text_input(
+        "Nome del profilo",
+        key=name_key,
+        max_chars=40,
+        help="Puoi rinominare il profilo come preferisci (es. «Piano gara Gallo», "
+             "«Prudente con caldo»). Il nome compare nei risultati, nelle colonne "
+             "del race plan e nella legenda del profilo altimetrico. Cambiando "
+             "preset il nome si aggiorna da solo, a meno che tu non l'abbia già "
+             "personalizzato.",
+    )
+    profile_name = (profile_name or "").strip() or preset
 
     if preset == "Conservativo":
         st.info("ℹ️ L'atleta correrà unicamente in Zona 1")
@@ -1290,25 +1314,30 @@ def render_profile_selector(key_prefix: str, title: str | None = None,
     )
 
     use_cauto = (preset == "Cauto")
-    return t_z2, t_z3, t_z4, t_z5, use_cauto, preset
+    return t_z2, t_z3, t_z4, t_z5, use_cauto, preset, profile_name
 
 
 compare_mode = st.checkbox("🔀 Confronta due profili (calcola un range)", key="race_compare_mode")
 
 if not compare_mode:
-    t_z2, t_z3, t_z4, t_z5, use_cauto, preset = render_profile_selector(
+    t_z2, t_z3, t_z4, t_z5, use_cauto, preset, name_single = render_profile_selector(
         "race", max_minutes_by_zone=max_minutes_by_zone
     )
 else:
     col_a, col_b = st.columns(2)
     with col_a:
-        t_z2_a, t_z3_a, t_z4_a, t_z5_a, use_cauto_a, preset_a = render_profile_selector(
+        t_z2_a, t_z3_a, t_z4_a, t_z5_a, use_cauto_a, preset_a, name_a = render_profile_selector(
             "race_a", "Profilo A", max_minutes_by_zone=max_minutes_by_zone
         )
     with col_b:
-        t_z2_b, t_z3_b, t_z4_b, t_z5_b, use_cauto_b, preset_b = render_profile_selector(
+        t_z2_b, t_z3_b, t_z4_b, t_z5_b, use_cauto_b, preset_b, name_b = render_profile_selector(
             "race_b", "Profilo B", max_minutes_by_zone=max_minutes_by_zone
         )
+
+    # I nomi finiscono come suffisso nei nomi di colonna del race plan: se
+    # coincidono, le colonne di B sovrascriverebbero quelle di A nel merge.
+    if name_a == name_b:
+        name_a, name_b = f"{name_a} (A)", f"{name_b} (B)"
 
 st.divider()
 
@@ -1422,7 +1451,7 @@ if st.button("🎯 Calcola previsione", key="compute_race_time"):
             st.error(f"⚠️ {result['error']}")
             st.session_state["prediction_ready"] = False
         else:
-            display_result(result)
+            display_result(result, label=name_single)
             st.session_state["prediction_ready"] = True
             st.session_state["prediction_compare_mode"] = False
             st.session_state["result_single"] = result
@@ -1431,9 +1460,9 @@ if st.button("🎯 Calcola previsione", key="compute_race_time"):
         result_b = compute_race_time(t_z2_b, t_z3_b, t_z4_b, t_z5_b, zone_efs_ref, race_efd_m, use_cauto_b)
 
         if result_a["error"]:
-            st.error(f"⚠️ Profilo A: {result_a['error']}")
+            st.error(f"⚠️ {name_a}: {result_a['error']}")
         if result_b["error"]:
-            st.error(f"⚠️ Profilo B: {result_b['error']}")
+            st.error(f"⚠️ {name_b}: {result_b['error']}")
 
         if not result_a["error"] and not result_b["error"]:
             times_h = [result_a["race_time_h"], result_b["race_time_h"]]
@@ -1443,22 +1472,22 @@ if st.button("🎯 Calcola previsione", key="compute_race_time"):
                 f"{seconds_to_hhmm(low_h * 3600)} – {seconds_to_hhmm(high_h * 3600)}",
             )
             st.caption(
-                f"Profilo A ({preset_a}): {seconds_to_hhmm(result_a['race_time_h'] * 3600)}  ·  "
-                f"Profilo B ({preset_b}): {seconds_to_hhmm(result_b['race_time_h'] * 3600)}"
+                f"{name_a}: {seconds_to_hhmm(result_a['race_time_h'] * 3600)}  ·  "
+                f"{name_b}: {seconds_to_hhmm(result_b['race_time_h'] * 3600)}"
             )
             st.session_state["prediction_ready"] = True
             st.session_state["prediction_compare_mode"] = True
             st.session_state["result_a"] = result_a
             st.session_state["result_b"] = result_b
-            st.session_state["preset_a_label"] = preset_a
-            st.session_state["preset_b_label"] = preset_b
+            st.session_state["preset_a_label"] = name_a
+            st.session_state["preset_b_label"] = name_b
         else:
             st.session_state["prediction_ready"] = False
 
         if not result_a["error"]:
-            display_result(result_a, label="Profilo A")
+            display_result(result_a, label=name_a)
         if not result_b["error"]:
-            display_result(result_b, label="Profilo B")
+            display_result(result_b, label=name_b)
 
 
 # ===========================================================

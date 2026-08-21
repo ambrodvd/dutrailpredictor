@@ -22,6 +22,26 @@ tra bucket adiacenti), calibrando i tempi lap-per-lap in modo che il totale
 torni esatto rispetto alla previsione di sezione 4.
 
 --------------------------------------------------------------------------
+NOTA SUGLI UPLOAD (.zip e file senza estensione)
+--------------------------------------------------------------------------
+Gli uploader accettano anche archivi .zip e file .gz (es. export
+TrainingPeaks, che consegna uno .zip contenente file .fit.gz, o file
+privi di estensione / con estensione sbagliata, da scompattare e
+rinominare a mano in .fit per essere leggibili).
+
+Pipeline di normalizzazione (expand_uploads):
+  1. gunzip  — se i bytes iniziano con 1f 8b vengono scompattati (anche
+     compressioni ripetute, max 3 giri);
+  2. unzip   — se sono uno zip, viene attraversato in memoria, e ogni
+     contenuto ripassa dal punto 1 (gli zip annidati sono gestiti);
+  3. sniff   — il formato si riconosce dai magic bytes, non dall'estensione:
+     un file FIT porta la stringa ASCII ".FIT" ai byte 8-11 dell'header,
+     un GPX è XML con root <gpx>.
+
+Nessuna scrittura su disco. In pratica: si trascina lo zip così com'è e
+non serve né scompattare né rinominare nulla.
+
+--------------------------------------------------------------------------
 NOTA SULLE PERFORMANCE (importante se modifichi il file)
 --------------------------------------------------------------------------
 Streamlit ri-esegue l'intero script a ogni interazione con un qualsiasi
@@ -42,6 +62,10 @@ va SEMPRE dietro una cache_data che riceve bytes/primitivi come argomenti,
 mai un file-like object o un DataFrame già "vivo" come argomento di cache,
 altrimenti la chiave di cache è instabile o l'hashing diventa esso stesso
 il collo di bottiglia.
+
+Nota: l'estrazione dagli zip avviene PRIMA delle funzioni cached e
+produce dei bytes, quindi la chiave di cache resta stabile esattamente
+come per un file caricato direttamente.
 --------------------------------------------------------------------------
 
 Run with:
@@ -49,6 +73,9 @@ Run with:
 """
 
 import io
+import gzip
+import zlib
+import zipfile
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -58,7 +85,7 @@ import xml.etree.ElementTree as ET
 import warnings
 import fitdecode
 
-st.set_page_config(page_title="FIT — EFD/EFS per zona FC", layout="wide")
+st.set_page_config(page_title=" 🔮 DU Trail Predictor", layout="wide")
 
 MIN_FILE_DURATION_S = 10 * 60  # file sotto questa durata esclusi dal riepilogo finale
 
@@ -155,6 +182,23 @@ def predict_delta_efs_blended(efd_pct: float, race_total_efd_km: float) -> float
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+GIORNI_IT = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"]
+MESI_IT = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
+           "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"]
+
+
+def format_date_it(dt, with_time: bool = True) -> str:
+    """'mercoledì 12 agosto 2026, 06:42'. Nomi hardcoded invece di usare
+    locale.setlocale(): il locale it_IT non è garantito sui container di
+    Streamlit Cloud e fallirebbe silenziosamente in inglese."""
+    if dt is None or pd.isna(dt):
+        return "-"
+    s = f"{GIORNI_IT[dt.weekday()]} {dt.day} {MESI_IT[dt.month - 1]} {dt.year}"
+    if with_time:
+        s += f", {dt.hour:02d}:{dt.minute:02d}"
+    return s
+
+
 def seconds_to_hhmm(seconds) -> str:
     """Format a duration in seconds as HH:MM:SS (or MM:SS if under an hour)."""
     if seconds is None or (isinstance(seconds, float) and np.isnan(seconds)):
@@ -165,6 +209,152 @@ def seconds_to_hhmm(seconds) -> str:
     if h > 0:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
+
+
+# ---------------------------------------------------------------------------
+# Riconoscimento formato + espansione archivi .zip
+# ---------------------------------------------------------------------------
+# TrainingPeaks (e altri export) consegnano un .zip in cui i file sono privi
+# di estensione o ne hanno una sbagliata. Invece di chiedere all'utente di
+# rinominare a mano, si guardano i magic bytes:
+#   - FIT : l'header contiene la stringa ASCII ".FIT" ai byte 8-11
+#   - GPX : XML con root <gpx>
+# Tutto avviene in memoria, nessuna scrittura su disco.
+
+ZIP_MAGIC = b"PK\x03\x04"
+GZIP_MAGIC = b"\x1f\x8b"
+
+# Estensioni "di trasporto" da togliere dal nome quando si ricostruisce
+# un nome pulito: TrainingPeaks consegna tipicamente <id>.fit.gz.
+_STRIPPABLE_EXT = {"gz", "gzip", "zip", "fit", "gpx", "dat", "txt", "bin"}
+
+
+def gunzip_if_needed(data: bytes, max_depth: int = 3) -> bytes:
+    """Scompatta i bytes se sono gzip (TrainingPeaks consegna .fit.gz).
+    Itera perché capita di trovare doppie compressioni; se la decompressione
+    fallisce si restituiscono i bytes così com'erano."""
+    if data is None:
+        return data
+    depth = 0
+    while data[:2] == GZIP_MAGIC and depth < max_depth:
+        try:
+            data = gzip.decompress(data)
+        except (OSError, EOFError, zlib.error):
+            break
+        depth += 1
+    return data
+
+
+def sniff_ext(data: bytes) -> str | None:
+    """Ritorna 'fit' o 'gpx' guardando il contenuto, None se non riconosciuto.
+    I bytes devono essere già scompattati (vedi gunzip_if_needed)."""
+    if data is None or len(data) < 16:
+        return None
+
+    if data[8:12] == b".FIT":
+        return "fit"
+
+    head = data[:2048].lstrip().lower()
+    if head.startswith(b"<?xml") or head.startswith(b"<"):
+        if b"<gpx" in head:
+            return "gpx"
+
+    return None
+
+
+def clean_base_name(name: str) -> str:
+    """'workouts/12345.fit.gz' -> '12345'. Toglie path e le estensioni di
+    trasporto impilate, così il nome finale non diventa '12345.fit.fit'."""
+    base = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    for _ in range(3):
+        stem, dot, suffix = base.rpartition(".")
+        if dot and suffix.lower() in _STRIPPABLE_EXT:
+            base = stem
+        else:
+            break
+    return base or name
+
+
+def _iter_zip_blobs(data: bytes, depth: int = 0):
+    """Restituisce (nome_interno, bytes) per ogni file dentro lo zip.
+    Ogni contenuto viene scompattato se gzip (.fit.gz) e attraversato se a
+    sua volta uno zip (max 2 livelli, per non finire in ricorsioni
+    patologiche su archivi malformati)."""
+    if depth > 2:
+        return
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        for info in z.infolist():
+            if info.is_dir():
+                continue
+            blob = gunzip_if_needed(z.read(info))
+            if blob[:4] == ZIP_MAGIC:
+                yield from _iter_zip_blobs(blob, depth + 1)
+            else:
+                yield info.filename, blob
+
+
+def expand_uploads(uploaded_files, accept=("fit",)):
+    """
+    Normalizza la lista di file caricati in [(nome, bytes, ext), ...].
+
+    - un file caricato direttamente viene riconosciuto dai magic bytes
+      (con fallback sull'estensione del nome);
+    - un .zip viene aperto in memoria e ogni contenuto riconosciuto come
+      formato in `accept` viene restituito come voce a sé stante;
+    - i nomi duplicati vengono resi univoci con un suffisso _2, _3, ...
+      perché sono usati come chiave in per_file_segments e nelle key dei
+      widget Streamlit.
+
+    Ritorna una lista vuota se non viene riconosciuto nulla.
+    """
+    out = []
+    seen = set()
+
+    def _add(name: str, blob: bytes, ext: str):
+        base = clean_base_name(name)
+        candidate = f"{base}.{ext}"
+        n = 1
+        while candidate in seen:
+            n += 1
+            candidate = f"{base}_{n}.{ext}"
+        seen.add(candidate)
+        out.append((candidate, blob, ext))
+
+    for up in uploaded_files or []:
+        # scompatta subito un eventuale .gz caricato direttamente
+        raw = gunzip_if_needed(up.getvalue())
+
+        if raw[:4] == ZIP_MAGIC:
+            found = 0
+            try:
+                for inner_name, blob in _iter_zip_blobs(raw):
+                    ext = sniff_ext(blob)
+                    if ext in accept:
+                        _add(inner_name, blob, ext)
+                        found += 1
+            except zipfile.BadZipFile:
+                st.error(f"⚠️ {up.name}: archivio zip non valido o corrotto.")
+                continue
+            if found == 0:
+                st.warning(
+                    f"⚠️ {up.name}: nessun file "
+                    f"{'/'.join('.' + a for a in accept)} riconosciuto nell'archivio."
+                )
+            else:
+                st.caption(
+                    f"📦 {up.name}: {found} file estratti dall'archivio."
+                )
+            continue
+
+        ext = sniff_ext(raw)
+        if ext is None:
+            ext = up.name.rsplit(".", 1)[-1].lower() if "." in up.name else ""
+        if ext in accept:
+            _add(up.name, raw, ext)
+        else:
+            st.warning(f"⚠️ {up.name}: formato non riconosciuto, file ignorato.")
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -182,12 +372,37 @@ def parse_fit(file_obj) -> pd.DataFrame:
     rest of the file still parses normally.
     """
     rows = []
+    utc_offset_s = None
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=UserWarning)
         with fitdecode.FitReader(file_obj) as fit:
             for frame in fit:
-                if frame.frame_type != fitdecode.FIT_FRAME_DATA or frame.name != "record":
+                if frame.frame_type != fitdecode.FIT_FRAME_DATA:
                     continue
+
+                # Il messaggio "activity" porta sia timestamp (UTC) sia
+                # local_timestamp (ora dell'orologio dell'atleta): la loro
+                # differenza è l'offset del fuso in cui l'attività è stata
+                # svolta. Serve per mostrare la data giusta: un'uscita
+                # serale delle 22:30 in Italia è salvata come 20:30 UTC, e
+                # una partenza dopo le 02:00 finirebbe sul giorno prima.
+                if frame.name == "activity":
+                    adata = {f.name: f.value for f in frame.fields}
+                    ts_utc = adata.get("timestamp")
+                    ts_loc = adata.get("local_timestamp")
+                    if ts_utc is not None and ts_loc is not None:
+                        try:
+                            a = ts_utc.replace(tzinfo=None)
+                            b = ts_loc.replace(tzinfo=None)
+                            # gli offset reali sono multipli di 15 minuti
+                            utc_offset_s = round((b - a).total_seconds() / 900) * 900
+                        except (AttributeError, TypeError):
+                            utc_offset_s = None
+                    continue
+
+                if frame.name != "record":
+                    continue
+
                 data = {f.name: f.value for f in frame.fields}
 
                 lat_raw = data.get("position_lat")
@@ -205,6 +420,10 @@ def parse_fit(file_obj) -> pd.DataFrame:
 
     df = pd.DataFrame(rows, columns=["lat", "lon", "ele", "hr", "timestamp"])
     df = df.dropna(subset=["lat", "lon", "timestamp"]).reset_index(drop=True)
+
+    # offset del fuso orario dell'attività (secondi), None se il file non
+    # contiene un messaggio "activity" con local_timestamp
+    df.attrs["utc_offset_s"] = utc_offset_s
 
     if df.empty:
         return df
@@ -449,6 +668,18 @@ def load_and_process_fit(file_bytes: bytes, smooth_window: int,
     segments, summary = process_track(df_points, smooth_window, resample_step_m, zones)
     if segments is None:
         return {"status": "degenerate"}
+
+    # Data/ora di inizio: primo timestamp valido dei record (UTC), riportato
+    # all'ora locale dell'atleta se il file dichiara l'offset del fuso.
+    start_utc = df_points["timestamp"].iloc[0]
+    offset_s = df_points.attrs.get("utc_offset_s")
+    if offset_s is not None:
+        start_local = start_utc + pd.Timedelta(seconds=offset_s)
+    else:
+        start_local = start_utc
+    summary["start_time"] = start_local.tz_localize(None) if start_local.tzinfo else start_local
+    summary["start_time_is_local"] = offset_s is not None
+
     return {"status": "ok", "segments": segments, "summary": summary}
 
 
@@ -555,10 +786,15 @@ st.divider()
 with st.sidebar:
     st.header("Impostazioni")
     uploaded_files = st.file_uploader(
-        "Carica uno o più file .fit", type=["fit"], accept_multiple_files=True
+        "Carica uno o più file .fit (anche .gz, o un .zip che li contiene)",
+        type=["fit", "gz", "zip"], accept_multiple_files=True
     )
     smooth_window = st.slider("Finestra di smoothing quota (punti)", 1, 31, 9, step=2)
     resample_step = st.slider("Passo di ricampionamento (m)", 5, 100, 20, step=5)
+    st.caption(
+        "Puoi caricare direttamente lo .zip di export (es. TrainingPeaks): i file al suo interno "
+        "vengono scompattati (.gz) e riconosciuti dal contenuto, non serve rinominarli in .fit."
+    )
     st.caption(
         "Lo smoothing ripulisce la quota grezza GPS/barometrica prima di calcolare la pendenza. "
         "Il passo di ricampionamento controlla la risoluzione orizzontale usata per integrare l'energia."
@@ -567,10 +803,12 @@ with st.sidebar:
 per_file_zone_tables = []  # list of (filename, zone_table, total_time_s)
 per_file_segments = {}     # filename -> segments dataframe (needed for Lap Analysis below)
 
-for uploaded in uploaded_files:
-    st.header(f"📄 {uploaded.name}")
+fit_uploads = expand_uploads(uploaded_files, accept=("fit",))
 
-    result = load_and_process_fit(uploaded.getvalue(), smooth_window, resample_step, zones)
+for fit_name, fit_bytes, _fit_ext in fit_uploads:
+    st.header(f"📄 {fit_name}")
+
+    result = load_and_process_fit(fit_bytes, smooth_window, resample_step, zones)
 
     if result["status"] == "invalid":
         st.error("Traccia non valida: mancano punti GPS/timestamp validi in questo file.")
@@ -583,7 +821,14 @@ for uploaded in uploaded_files:
         continue
 
     segments, summary = result["segments"], result["summary"]
-    per_file_segments[uploaded.name] = segments
+    per_file_segments[fit_name] = segments
+
+    start_dt = summary.get("start_time")
+    if start_dt is not None:
+        date_label = f"🗓️ {format_date_it(start_dt)}"
+        if not summary.get("start_time_is_local", False):
+            date_label += "  ·  ora UTC (il file non dichiara il fuso)"
+        st.caption(date_label)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Distanza orizzontale", f"{summary['horizontal_distance_m']/1000:.2f} km")
@@ -608,11 +853,11 @@ for uploaded in uploaded_files:
         st.download_button(
             label="📥 Scarica tabella zone (CSV)",
             data=zone_table.to_csv(index=False).encode('utf-8'),
-            file_name=f"{uploaded.name.rsplit('.', 1)[0]}_zone_efs.csv",
+            file_name=f"{fit_name.rsplit('.', 1)[0]}_zone_efs.csv",
             mime='text/csv',
-            key=f"dl_{uploaded.name}",
+            key=f"dl_{fit_name}",
         )
-        per_file_zone_tables.append((uploaded.name, zone_table, summary["total_time_s"]))
+        per_file_zone_tables.append((fit_name, zone_table, summary["total_time_s"]))
 
     with st.expander("Dettaglio segmenti (debug)"):
         st.dataframe(segments, use_container_width=True)
@@ -688,25 +933,28 @@ st.header("🎯 Previsione Tempo Gara")
 # --- 1. Percorso gara --------------------------------------------------
 st.subheader("1️⃣ Percorso gara (GPX o FIT)")
 race_files = st.file_uploader(
-    "Carica uno o più file del percorso gara (.gpx o .fit)",
-    type=["gpx", "fit"],
+    "Carica uno o più file del percorso gara (.gpx, .fit, .gz o .zip)",
+    type=["gpx", "fit", "gz", "zip"],
     accept_multiple_files=True,
     key="race_course_files",
 )
 
-if race_files:
-    race_names = [f.name for f in race_files]
+race_uploads = expand_uploads(race_files, accept=("fit", "gpx"))
+
+if race_uploads:
+    race_names = [name for name, _b, _e in race_uploads]
     selected_race_name = st.selectbox(
         "Seleziona il file gara da usare per la previsione:",
         race_names,
         key="selected_race_file",
     )
-    selected_race_file = next(f for f in race_files if f.name == selected_race_name)
-    ext = selected_race_file.name.rsplit(".", 1)[-1].lower()
+    _, selected_race_bytes, ext = next(
+        r for r in race_uploads if r[0] == selected_race_name
+    )
 
     try:
         race_summary, race_profile = load_and_process_race(
-            selected_race_file.getvalue(), ext, smooth_window, resample_step
+            selected_race_bytes, ext, smooth_window, resample_step
         )
         if race_summary is None:
             st.error("⚠️ Traccia gara non valida o degenere: mancano punti GPS sufficienti.")
@@ -879,7 +1127,7 @@ def render_profile_selector(key_prefix: str, title: str | None = None,
 
     preset = st.radio(
         "Profilo di gara:",
-        ["Cauto", "Conservativo", "Coraggioso", "Competitivo", "Massimo", "Personalizzato"],
+        ["Personalizzato", "Cauto", "Conservativo", "Coraggioso", "Competitivo", "Massimo"],
         horizontal=True,
         key=f"{key_prefix}_profile_preset",
     )

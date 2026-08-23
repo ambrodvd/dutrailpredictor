@@ -1347,7 +1347,7 @@ with st.sidebar:
         help="Utile per chi registra le uscite di scarico o i ricognitivi come 'hiking'.",
     )
     min_duration_min = st.slider(
-        "Durata minima allenamento (min)", 0, 120, 10, step=5,
+        "Durata minima allenamento (min)", 0, 180, 110, step=10,
         help="I file più corti vengono esclusi da tutta l'analisi, non solo dalla media.",
     )
 
@@ -1553,9 +1553,14 @@ with tab_training:
             "bottone accanto al file.\n\n" + dettaglio
         )
 
+    # Segnaposto per il riepilogo finale: si crea QUI (quindi compare in cima,
+    # sopra i singoli file) ma si riempie dopo il loop, quando per_file_zone_tables
+    # esiste davvero. Senza container il riepilogo potrebbe solo stare in fondo,
+    # perché Streamlit disegna nell'ordine in cui il codice viene eseguito.
+    summary_slot = st.container()
+
     for fit_name, fit_bytes, _fit_ext in fit_uploads:
         is_excluded = fit_name in excluded_files
-
         head_col, btn_col = st.columns([5, 1])
         with head_col:
             st.header(f"📄 {fit_name}")
@@ -1610,10 +1615,11 @@ with tab_training:
                 date_label += f"  ·  ⚠️ stessa partenza di: {', '.join(gemelli)}"
             st.caption(date_label)
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Distanza orizzontale", f"{summary['horizontal_distance_m']/1000:.2f} km")
-        c2.metric("D+ / D−", f"{summary['d_plus_m']:.0f} m / {summary['d_minus_m']:.0f} m")
-        c3.metric("EFD totale", f"{summary['efd_m']/1000:.2f} km")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Durata", seconds_to_hhmm(summary["total_time_s"]))
+        c2.metric("Distanza orizzontale", f"{summary['horizontal_distance_m']/1000:.2f} km")
+        c3.metric("D+ / D−", f"{summary['d_plus_m']:.0f} m / {summary['d_minus_m']:.0f} m")
+        c4.metric("EFD totale", f"{summary['efd_m']/1000:.2f} km")
 
         st.subheader("EFS media per zona cardiaca")
         zone_table = zone_efs_table(segments)
@@ -1646,64 +1652,69 @@ with tab_training:
     included = [(name, tbl) for name, tbl, total_t in per_file_zone_tables if total_t >= _min_dur_s]
     excluded = [name for name, tbl, total_t in per_file_zone_tables if total_t < _min_dur_s]
 
-    if included:
-        st.header("📊 Riepilogo finale (media tra i file)")
-        if excluded_files:
-            st.caption(
-                "File esclusi manualmente: " + ", ".join(sorted(excluded_files))
+    with summary_slot:
+        if included:
+            st.header("📊 Riepilogo finale (media tra i file)")
+            if excluded_files:
+                st.caption(
+                    "File esclusi manualmente: " + ", ".join(sorted(excluded_files))
+                )
+            if excluded:
+                st.caption(
+                    f"File esclusi dalla media perché più corti di {min_duration_min} minuti: "
+                    + ", ".join(excluded)
+                )
+
+            all_tables = pd.concat(
+                [tbl.assign(file=name) for name, tbl in included], ignore_index=True
             )
-        if excluded:
-            st.caption(
-                f"File esclusi dalla media perché più corti di {MIN_FILE_DURATION_S // 60} minuti: "
-                + ", ".join(excluded)
+
+            summary_rows = []
+            for z in ["Z1", "Z2", "Z3", "Z4", "Z5"]:
+                zdf = all_tables[all_tables["Zona"] == z]
+                if zdf.empty:
+                    continue
+                total_time_min = zdf["Tempo (min)"].sum()
+                total_efd_km = zdf["EFD (km)"].sum()
+                max_time_min = zdf["Tempo (min)"].max()  # massimo in un singolo file
+                # media pesata: EFS = EFD totale / tempo totale (non media delle medie)
+                efs_weighted = (total_efd_km / (total_time_min / 60)) if total_time_min > 0 else np.nan
+                summary_rows.append({
+                    "Zona": z,
+                    "Tempo totale (min)": int(round(total_time_min)),
+                    "Durata massima (min)": int(round(max_time_min)),
+                    "EFD totale (km)": total_efd_km,
+                    "EFS media (km/h)": efs_weighted,
+                    "N. file": len(zdf),
+                })
+
+            final_summary = pd.DataFrame(summary_rows)
+            st.session_state['final_summary_df'] = final_summary
+            st.session_state['max_minutes_by_zone'] = dict(
+                zip(final_summary["Zona"], final_summary["Durata massima (min)"])
             )
-
-        all_tables = pd.concat(
-            [tbl.assign(file=name) for name, tbl in included], ignore_index=True
-        )
-
-        summary_rows = []
-        for z in ["Z1", "Z2", "Z3", "Z4", "Z5"]:
-            zdf = all_tables[all_tables["Zona"] == z]
-            if zdf.empty:
-                continue
-            total_time_min = zdf["Tempo (min)"].sum()
-            total_efd_km = zdf["EFD (km)"].sum()
-            max_time_min = zdf["Tempo (min)"].max()  # massimo in un singolo file
-            # media pesata: EFS = EFD totale / tempo totale (non media delle medie)
-            efs_weighted = (total_efd_km / (total_time_min / 60)) if total_time_min > 0 else np.nan
-            summary_rows.append({
-                "Zona": z,
-                "Tempo totale (min)": int(round(total_time_min)),
-                "Durata massima (min)": int(round(max_time_min)),
-                "EFD totale (km)": total_efd_km,
-                "EFS media (km/h)": efs_weighted,
-                "N. file": len(zdf),
-            })
-
-        final_summary = pd.DataFrame(summary_rows)
-        st.session_state['final_summary_df'] = final_summary
-        st.session_state['max_minutes_by_zone'] = dict(
-            zip(final_summary["Zona"], final_summary["Durata massima (min)"])
-        )
-        st.dataframe(
-            final_summary.style.format({
-                "EFD totale (km)": "{:.2f}",
-                "EFS media (km/h)": "{:.2f}",
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.download_button(
-            label="📥 Scarica riepilogo finale (CSV)",
-            data=final_summary.to_csv(index=False).encode('utf-8'),
-            file_name="riepilogo_finale_zone_efs.csv",
-            mime='text/csv',
-        )
-    elif per_file_zone_tables:
-        st.info(f"Tutti i file caricati sono più corti di {MIN_FILE_DURATION_S // 60} minuti: nessun riepilogo finale calcolato.")
-
-
+            st.dataframe(
+                final_summary.style.format({
+                    "EFD totale (km)": "{:.2f}",
+                    "EFS media (km/h)": "{:.2f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.download_button(
+                label="📥 Scarica riepilogo finale (CSV)",
+                data=final_summary.to_csv(index=False).encode('utf-8'),
+                file_name="riepilogo_finale_zone_efs.csv",
+                mime='text/csv',
+            )
+            st.caption(f"Dettaglio dei {len(fit_uploads)} file qui sotto ⬇️")
+            st.divider()
+        elif per_file_zone_tables:
+            st.info(
+                f"Tutti i file caricati sono più corti di {min_duration_min} minuti: "
+                "nessun riepilogo finale calcolato."
+            )
+            st.divider()
 
 
 with tab_race:

@@ -85,6 +85,7 @@ import xml.etree.ElementTree as ET
 import warnings
 import fitdecode
 import plotly.graph_objects as go
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title=" 🔮 DU Trail Predictor", layout="wide")
 
@@ -405,6 +406,8 @@ def parse_fit(file_obj) -> pd.DataFrame:
     """
     rows = []
     utc_offset_s = None
+    sport_name = None
+    sub_sport_name = None
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=UserWarning)
         with fitdecode.FitReader(file_obj) as fit:
@@ -432,6 +435,21 @@ def parse_fit(file_obj) -> pd.DataFrame:
                             utc_offset_s = None
                     continue
 
+                # Lo sport è dichiarato nel messaggio "sport" (di solito in testa
+                # al file) e ripetuto nel "session" (in coda). Si prende il primo
+                # che arriva. Valori tipici: running / cycling / hiking / walking,
+                # con sub_sport trail / road / treadmill / generic.
+                # Alcuni file non lo dichiarano affatto: resta None e a valle il
+                # file NON viene scartato, solo segnalato.
+                if frame.name in ("sport", "session") and sport_name is None:
+                    sdata = {f.name: f.value for f in frame.fields}
+                    sp = sdata.get("sport")
+                    if sp is not None:
+                        sport_name = str(sp).lower()
+                        sub = sdata.get("sub_sport")
+                        sub_sport_name = str(sub).lower() if sub is not None else None
+                    continue
+
                 if frame.name != "record":
                     continue
 
@@ -456,6 +474,8 @@ def parse_fit(file_obj) -> pd.DataFrame:
     # offset del fuso orario dell'attività (secondi), None se il file non
     # contiene un messaggio "activity" con local_timestamp
     df.attrs["utc_offset_s"] = utc_offset_s
+    df.attrs["sport"] = sport_name
+    df.attrs["sub_sport"] = sub_sport_name
 
     if df.empty:
         return df
@@ -700,6 +720,84 @@ def cum_dplus_at_km(race_profile, km_value):
 
 def cum_dminus_at_km(race_profile, km_value):
     return float(np.interp(km_value, race_profile["km"], race_profile["cum_dminus_m"]))
+
+# Mini-guida illustrata all'export TrainingPeaks, mostrata nella sidebar accanto
+# all'uploader. SVG inline invece di screenshot: pesa nulla, resta nitido a
+# qualsiasi zoom e non va rifatto se cambia il tema. Va renderizzata con
+# components.html (vedi nota nella sidebar), non con st.markdown.
+# Disegnata stretta (230 px) perché la sidebar di Streamlit è ~250 px.
+TRAININGPEAKS_GUIDE_SVG = """
+<div style="margin:0;padding:0;font-family:-apple-system,Segoe UI,Roboto,sans-serif">
+<svg viewBox="0 0 230 420" width="230" height="420"
+     xmlns="http://www.w3.org/2000/svg">
+  <style>
+    text  { font-family:-apple-system,Segoe UI,Roboto,sans-serif; }
+    .card { fill:#ffffff; stroke:#d7dce3; stroke-width:1; }
+    .bar  { fill:#f2f4f7; }
+    .num  { fill:#1f4e79; }
+    .numt { fill:#ffffff; font-size:12px; font-weight:700; }
+    .step { fill:#111827; font-size:12px; font-weight:600; }
+    .lbl  { fill:#1f2937; font-size:11px; }
+    .hint { fill:#6b7280; font-size:10px; }
+    .hi   { fill:#fef3c7; stroke:#f59e0b; stroke-width:1.5; }
+    .btn  { fill:#1f4e79; }
+    .btnt { fill:#ffffff; font-size:10px; font-weight:600; }
+    .fld  { fill:#ffffff; stroke:#c7cdd6; stroke-width:1; }
+  </style>
+
+  <!-- ============ STEP 1 ============ -->
+  <circle class="num" cx="11" cy="12" r="10"/>
+  <text class="numt" x="11" y="16" text-anchor="middle">1</text>
+  <text class="step" x="28" y="16">Clicca la rotella</text>
+
+  <rect class="card" x="4" y="28" width="222" height="42" rx="6"/>
+  <circle cx="26" cy="49" r="9" fill="#e5e7eb"/>
+  <text class="lbl" x="44" y="53">Nome atleta</text>
+  <path d="M120 46 l7 7 7-7z" fill="#1f4e79"/>
+  <rect class="hi" x="180" y="38" width="26" height="24" rx="5"/>
+  <text x="193" y="55" text-anchor="middle" font-size="13">⚙</text>
+
+  <!-- ============ STEP 2 ============ -->
+  <circle class="num" cx="11" cy="103" r="10"/>
+  <text class="numt" x="11" y="107" text-anchor="middle">2</text>
+  <text class="step" x="28" y="107">Vai su Export Data</text>
+
+  <rect class="card" x="4" y="119" width="222" height="104" rx="6"/>
+  <rect class="bar" x="5" y="120" width="96" height="102"/>
+  <text class="hint" x="16" y="140">Profile</text>
+  <text class="hint" x="16" y="158">Settings</text>
+  <text class="hint" x="16" y="176">Coaches</text>
+  <rect class="hi" x="11" y="185" width="86" height="22" rx="5"/>
+  <text class="lbl" x="17" y="200" font-weight="600">Export Data</text>
+  <text class="hint" x="112" y="158">Scarica i file</text>
+  <text class="hint" x="112" y="174">di allenamento</text>
+  <text class="hint" x="112" y="190">in un unico .zip</text>
+
+  <!-- ============ STEP 3 ============ -->
+  <circle class="num" cx="11" cy="256" r="10"/>
+  <text class="numt" x="11" y="260" text-anchor="middle">3</text>
+  <text class="step" x="28" y="260">Scegli le date, poi Export</text>
+
+  <rect class="card" x="4" y="272" width="222" height="140" rx="6"/>
+  <text class="lbl" x="16" y="294" font-weight="700">Workout Files</text>
+
+  <text class="hint" x="16" y="322">From</text>
+  <rect class="fld" x="46" y="310" width="62" height="17" rx="4"/>
+  <text class="hint" x="118" y="322">To</text>
+  <rect class="fld" x="136" y="310" width="62" height="17" rx="4"/>
+
+  <text class="hint" x="16" y="350">Format</text>
+  <text class="lbl" x="58" y="350" font-weight="700">GZIP</text>
+  <rect class="hi" x="136" y="337" width="62" height="20" rx="5"/>
+  <rect class="btn" x="140" y="340" width="54" height="15" rx="4"/>
+  <text class="btnt" x="167" y="351" text-anchor="middle">Export</text>
+
+  <text class="hint" x="16" y="380">Le altre due sezioni</text>
+  <text class="hint" x="16" y="395">(Summary, Custom Metrics)</text>
+  <text class="hint" x="16" y="410">non servono.</text>
+</svg>
+</div>
+"""
 
 LAP_COLORS = [
     "#1f4e79", "#f2c14e", "#8fb339", "#c1440e",
@@ -1151,6 +1249,8 @@ def load_and_process_fit(file_bytes: bytes, smooth_window: int,
         start_local = start_utc
     summary["start_time"] = start_local.tz_localize(None) if start_local.tzinfo else start_local
     summary["start_time_is_local"] = offset_s is not None
+    summary["sport"] = df_points.attrs.get("sport")
+    summary["sub_sport"] = df_points.attrs.get("sub_sport")
 
     return {"status": "ok", "segments": segments, "summary": summary}
 
@@ -1221,12 +1321,40 @@ with st.sidebar:
         "Carica uno o più file .fit (anche .gz, o un .zip che li contiene)",
         type=["fit", "gz", "zip"], accept_multiple_files=True
     )
+    with st.expander("❓ Come esportare da TrainingPeaks"):
+        # NON usare st.markdown(unsafe_allow_html=True): il sanitizer di Streamlit
+        # scarta rect/circle/path/style e lascia solo i <text>, che collassano in
+        # un blocco di parole. components.html rende in un iframe isolato, dove
+        # l'SVG arriva intatto. In cambio l'altezza va dichiarata a mano (l'iframe
+        # non si auto-dimensiona): se modifichi il disegno, aggiorna anche height.
+        components.html(TRAININGPEAKS_GUIDE_SVG, height=430)
+        st.caption(
+            "Carica qui sopra lo .zip così com'è: contiene file `.fit.gz` che l'app "
+            "scompatta e riconosce dal contenuto. Non serve rinominare nulla."
+        )
+
+    st.divider()
+    st.subheader("Filtri sui file")
+
+    only_running = st.checkbox(
+        "Allenamenti di corsa e trail", value=True,
+        help="Scarta i file che dichiarano uno sport diverso (bici, nuoto, palestra…). "
+             "I file che non dichiarano lo sport vengono comunque tenuti.",
+    )
+    include_hiking = st.checkbox(
+        "Includi Hiking", value=False,
+        disabled=not only_running,
+        help="Utile per chi registra le uscite di scarico o i ricognitivi come 'hiking'.",
+    )
+    min_duration_min = st.slider(
+        "Durata minima allenamento (min)", 0, 120, 10, step=5,
+        help="I file più corti vengono esclusi da tutta l'analisi, non solo dalla media.",
+    )
+
+    st.divider()
     smooth_window = st.slider("Finestra di smoothing quota (punti)", 1, 31, 9, step=2)
     resample_step = st.slider("Passo di ricampionamento (m)", 5, 100, 20, step=5)
-    st.caption(
-        "Puoi caricare direttamente lo .zip di export (es. TrainingPeaks): i file al suo interno "
-        "vengono scompattati (.gz) e riconosciuti dal contenuto, non serve rinominarli in .fit."
-    )
+
     st.caption(
         "Lo smoothing ripulisce la quota grezza GPS/barometrica prima di calcolare la pendenza. "
         "Il passo di ricampionamento controlla la risoluzione orizzontale usata per integrare l'energia."
@@ -1314,7 +1442,48 @@ with tab_training:
 
     fit_uploads = expand_uploads(uploaded_files, accept=("fit",))
 
-    # --- esclusione manuale di singoli file ------------------------------------
+    # --- filtri automatici: sport e durata --------------------------------------
+    # Girano PRIMA del rendering: con un export massivo (centinaia di file)
+    # disegnare header, metriche ed expander anche per i file scartati renderebbe
+    # la pagina inusabile. I file scartati si riassumono in una riga sola.
+    # I file con status != "ok" passano comunque: l'errore lo mostra il loop sotto.
+    RUNNING_SPORTS = {"running"}
+    HIKING_SPORTS = {"hiking", "walking"}
+    _allowed_sports = RUNNING_SPORTS | (HIKING_SPORTS if include_hiking else set())
+
+    auto_skipped = []
+    _kept = []
+    for _name, _blob, _ext in fit_uploads:
+        _res = load_and_process_fit(_blob, smooth_window, resample_step, zones)
+        if _res.get("status") != "ok":
+            _kept.append((_name, _blob, _ext))
+            continue
+
+        _sport = _res["summary"].get("sport")
+        _dur_s = _res["summary"].get("total_time_s", 0.0)
+
+        if only_running and _sport is not None and _sport not in _allowed_sports:
+            auto_skipped.append((_name, f"sport «{_sport}»"))
+            continue
+        if _dur_s < min_duration_min * 60:
+            auto_skipped.append((_name, f"durata {seconds_to_hhmm(_dur_s)}"))
+            continue
+        _kept.append((_name, _blob, _ext))
+
+    fit_uploads = _kept
+
+    if auto_skipped:
+        with st.expander(f"🧹 {len(auto_skipped)} file esclusi automaticamente"):
+            st.dataframe(
+                pd.DataFrame(auto_skipped, columns=["File", "Motivo"]),
+                use_container_width=True, hide_index=True,
+            )
+            st.caption(
+                "Regola i filtri nella sidebar per cambiare questi criteri. "
+                "I file che non dichiarano lo sport non vengono mai esclusi per sport."
+            )
+
+    # --- esclusione manuale di singoli file ---
     # I nomi prodotti da expand_uploads sono deterministici a parità di upload,
     # quindi si possono usare come identificativo stabile tra un rerun e l'altro.
     if "excluded_fit_files" not in st.session_state:
@@ -1427,6 +1596,12 @@ with tab_training:
             date_label = f"🗓️ {format_date_it(start_dt)}"
             if not summary.get("start_time_is_local", False):
                 date_label += "  ·  ora UTC (il file non dichiara il fuso)"
+            _sp = summary.get("sport")
+            _sub = summary.get("sub_sport")
+            if _sp:
+                date_label += f"  ·  🏷️ {_sp}" + (f" / {_sub}" if _sub and _sub != "generic" else "")
+            else:
+                date_label += "  ·  🏷️ sport non dichiarato nel file"
             if fit_name in duplicated_names:
                 gemelli = [
                     n for names in dup_groups.values() if fit_name in names
@@ -1465,8 +1640,11 @@ with tab_training:
     # ---------------------------------------------------------------------------
     # Riepilogo finale aggregato su tutti i file
     # ---------------------------------------------------------------------------
-    included = [(name, tbl) for name, tbl, total_t in per_file_zone_tables if total_t >= MIN_FILE_DURATION_S]
-    excluded = [name for name, tbl, total_t in per_file_zone_tables if total_t < MIN_FILE_DURATION_S]
+    # La soglia di durata è già stata applicata nel pre-pass sopra: qui resta solo
+    # come rete di sicurezza, con lo stesso valore scelto dall'utente.
+    _min_dur_s = min_duration_min * 60
+    included = [(name, tbl) for name, tbl, total_t in per_file_zone_tables if total_t >= _min_dur_s]
+    excluded = [name for name, tbl, total_t in per_file_zone_tables if total_t < _min_dur_s]
 
     if included:
         st.header("📊 Riepilogo finale (media tra i file)")

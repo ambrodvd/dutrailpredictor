@@ -633,6 +633,42 @@ def zone_efs_table(segments: pd.DataFrame) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
+# ---------------------------------------------------------------------------
+# Limitazione del numero di allenamenti in analisi
+# ---------------------------------------------------------------------------
+# Con un export massivo (centinaia di file) la media di zona finisce dominata
+# dalle uscite brevi e lente. I due filtri tengono solo i "migliori" N secondo
+# un criterio di volume e/o uno di intensità. Sono COMBINABILI IN UNIONE:
+# 5 più lunghi + 3 più veloci danno fino a 8 file, meno se qualcuno coincide.
+LIMIT_METRICS = {
+    "Durata": "dur_s",
+    "Distanza (km)": "dist_km",
+    "EFD (km)": "efd_km",
+}
+
+
+def select_limited_files(pool: list, stats: dict, cfg: dict) -> tuple:
+    """Ritorna (set_nomi_da_tenere, lista_messaggi). `pool` sono i nomi
+    candidati, `stats` la mappa nome -> metriche, `cfg` la configurazione
+    confermata dall'utente col bottone Applica."""
+    keep, msgs = set(), []
+
+    def _top(metric_key: str, n: int, etichetta: str):
+        if n > len(pool):
+            msgs.append(
+                f"Hai chiesto i **{n}** allenamenti {etichetta}, ma ne sono "
+                f"disponibili solo **{len(pool)}**: vengono tenuti tutti."
+            )
+        ranked = sorted(pool, key=lambda nm: stats[nm][metric_key], reverse=True)
+        return set(ranked[:n])
+
+    if cfg.get("by_dur"):
+        keep |= _top(LIMIT_METRICS[cfg["dur_metric"]], cfg["n_dur"],
+                     f"più lunghi per «{cfg['dur_metric']}»")
+    if cfg.get("by_spd"):
+        keep |= _top("efs", cfg["n_spd"], "più veloci per EFS media")
+
+    return keep, msgs
 
 # ---------------------------------------------------------------------------
 # Calcolo EFD totale di un percorso (nessuna HR/zona richiesta)
@@ -1308,7 +1344,7 @@ st.caption(
 tab_hr, tab_training, tab_race, tab_plan, tab_export, tab_compare = st.tabs([
     "❤️ Zone FC",
     "📊 Allenamenti",
-    "🎯 Gara e profilo",
+    "🔮 Predizione",
     "🗺️ Race Plan",
     "📄 Export",
     "🆚 Confronto",
@@ -1332,24 +1368,6 @@ with st.sidebar:
             "Carica qui sopra lo .zip così com'è: contiene file `.fit.gz` che l'app "
             "scompatta e riconosce dal contenuto. Non serve rinominare nulla."
         )
-
-    st.divider()
-    st.subheader("Filtri sui file")
-
-    only_running = st.checkbox(
-        "Allenamenti di corsa e trail", value=True,
-        help="Scarta i file che dichiarano uno sport diverso (bici, nuoto, palestra…). "
-             "I file che non dichiarano lo sport vengono comunque tenuti.",
-    )
-    include_hiking = st.checkbox(
-        "Includi Hiking", value=False,
-        disabled=not only_running,
-        help="Utile per chi registra le uscite di scarico o i ricognitivi come 'hiking'.",
-    )
-    min_duration_min = st.slider(
-        "Durata minima allenamento (min)", 0, 180, 110, step=10,
-        help="I file più corti vengono esclusi da tutta l'analisi, non solo dalla media.",
-    )
 
     st.divider()
     smooth_window = st.slider("Finestra di smoothing quota (punti)", 1, 31, 9, step=2)
@@ -1438,9 +1456,214 @@ with tab_hr:
 
 with tab_training:
     per_file_zone_tables = []  # list of (filename, zone_table, total_time_s)
-    per_file_segments = {}     # filename -> segments dataframe (needed for Lap Analysis below)
+    per_file_segments = {}     # filename -> segments dataframe
+
+    # ------------------------------------------------------------------
+    # Filtri. Stanno qui e non nella sidebar perché l'utente deve vederli
+    # accanto al riepilogo su cui agiscono.
+    # ------------------------------------------------------------------
+    st.subheader("🔎 Filtri sugli allenamenti")
+
+    f1, f2, f3 = st.columns([1, 1, 2])
+    only_running = f1.checkbox(
+        "Solo corsa e trail", value=True,
+        help="Scarta i file che dichiarano uno sport diverso (bici, nuoto, palestra…). "
+             "I file che non dichiarano lo sport vengono comunque tenuti.",
+    )
+    include_hiking = f2.checkbox(
+        "Includi Hiking", value=False, disabled=not only_running,
+        help="Utile per chi registra le uscite di scarico o i ricognitivi come 'hiking'.",
+    )
+    min_duration_min = f3.slider(
+        "Durata minima allenamento (min)", 0, 180, 110, step=10,
+        help="I file più corti vengono esclusi da tutta l'analisi, non solo dalla media.",
+    )
 
     fit_uploads = expand_uploads(uploaded_files, accept=("fit",))
+
+    # --- filtri automatici: sport e durata --------------------------------------
+    # Girano PRIMA del rendering: con un export massivo disegnare header, metriche
+    # ed expander anche per i file scartati renderebbe la pagina inusabile.
+    # I file con status != "ok" passano comunque: l'errore lo mostra il loop sotto.
+    RUNNING_SPORTS = {"running"}
+    HIKING_SPORTS = {"hiking", "walking"}
+    _allowed_sports = RUNNING_SPORTS | (HIKING_SPORTS if include_hiking else set())
+
+    auto_skipped = []
+    _kept = []
+    file_stats = {}   # nome -> metriche, usate dai filtri di limitazione sotto
+    for _name, _blob, _ext in fit_uploads:
+        _res = load_and_process_fit(_blob, smooth_window, resample_step, zones)
+        if _res.get("status") != "ok":
+            _kept.append((_name, _blob, _ext))
+            continue
+
+        _sport = _res["summary"].get("sport")
+        _dur_s = _res["summary"].get("total_time_s", 0.0)
+
+        if only_running and _sport is not None and _sport not in _allowed_sports:
+            auto_skipped.append((_name, f"sport «{_sport}»"))
+            continue
+        if _dur_s < min_duration_min * 60:
+            auto_skipped.append((_name, f"durata {seconds_to_hhmm(_dur_s)}"))
+            continue
+
+        _efd_km = _res["summary"]["efd_m"] / 1000
+        _start = _res["summary"].get("start_time")
+        file_stats[_name] = {
+            "dur_s": _dur_s,
+            "dist_km": _res["summary"]["horizontal_distance_m"] / 1000,
+            "efd_km": _efd_km,
+            "d_plus_m": _res["summary"]["d_plus_m"],
+            "d_minus_m": _res["summary"]["d_minus_m"],
+            "efs": (_efd_km / (_dur_s / 3600)) if _dur_s > 0 else 0.0,
+            # timestamp in secondi: serve solo come chiave di ordinamento,
+            # 0.0 se il file non dichiara una data valida
+            "start_ts": (pd.Timestamp(_start).timestamp()
+                         if _start is not None and pd.notna(_start) else 0.0),
+        }
+        _kept.append((_name, _blob, _ext))
+
+    fit_uploads = _kept
+
+    if auto_skipped:
+        with st.expander(f"🧹 {len(auto_skipped)} file esclusi automaticamente"):
+            st.dataframe(
+                pd.DataFrame(auto_skipped, columns=["File", "Motivo"]),
+                use_container_width=True, hide_index=True,
+            )
+            st.caption(
+                "Regola i filtri qui sopra per cambiare questi criteri. "
+                "I file che non dichiarano lo sport non vengono mai esclusi per sport."
+            )
+
+    # --- esclusione manuale di singoli file ---
+    # I nomi prodotti da expand_uploads sono deterministici a parità di upload,
+    # quindi si possono usare come identificativo stabile tra un rerun e l'altro.
+    if "excluded_fit_files" not in st.session_state:
+        st.session_state["excluded_fit_files"] = set()
+    excluded_files = st.session_state["excluded_fit_files"]
+
+    # Ripulisce i nomi non più presenti tra i file caricati: senza questo, un
+    # file rimosso e ricaricato più tardi resterebbe escluso a sorpresa.
+    excluded_files &= {name for name, _b, _e in fit_uploads}
+
+    # ------------------------------------------------------------------
+    # Limitazione del numero di allenamenti
+    # ------------------------------------------------------------------
+    # I filtri NON si applicano mentre l'utente li imposta: la selezione
+    # diventa effettiva solo premendo "Applica", così un export grosso non
+    # viene ricalcolato a ogni singolo click.
+    if "workout_limit_cfg" not in st.session_state:
+        st.session_state["workout_limit_cfg"] = None
+
+    _pool = [n for n, _b, _e in fit_uploads
+             if n in file_stats and n not in excluded_files]
+
+    if _pool:
+        # Callout riquadrato invece della sola checkbox: la label di un widget
+        # Streamlit accetta markdown ma non la dimensione del font, quindi il
+        # testo grande vive in un st.markdown sopra e la checkbox resta corta.
+        with st.container(border=True):
+            st.markdown(
+                "##### Attenzione\n"
+                "Con molti allenamenti caricati la predizione può risultare errata. " \
+                "Puoi limitare l'analisi ai "
+                "soli allenamenti più significativi."
+            )
+            limit_on = st.checkbox(
+                "**Limita il numero di allenamenti in analisi**",
+                key="limit_workouts_on",
+            )
+
+            if limit_on:
+                st.divider()
+                st.caption(f"Allenamenti attualmente disponibili: **{len(_pool)}**")
+                c_dur, c_spd = st.columns(2)
+
+                with c_dur:
+                    by_dur = st.checkbox("Analizza gli allenamenti più lunghi",
+                                         key="limit_by_duration")
+                    st.caption("Questo filtro ti consente di tenere solo gli allenamenti più lunghi")
+                    dur_metric = st.radio(
+                        "Criterio di lunghezza:", list(LIMIT_METRICS),
+                        key="limit_duration_metric", disabled=not by_dur,
+                    )
+                    n_dur = st.number_input(
+                        "Seleziona il numero di allenamenti da tenere", min_value=1, value=5, step=1,
+                        key="limit_n_duration", disabled=not by_dur,
+                    )
+
+                with c_spd:
+                    by_spd = st.checkbox("Analizza gli allenamenti più veloci",
+                                         key="limit_by_speed")
+                    st.caption("Questo filtro ti consente di tenere gli allenamenti più veloci")
+                    n_spd = st.number_input(
+                        "Seleziona il numero di allenamenti da tenere", min_value=1, value=5, step=1,
+                        key="limit_n_speed", disabled=not by_spd,
+                    )
+
+                b1, b2 = st.columns(2)
+                if b1.button("✅ Applica filtri", type="primary",
+                             use_container_width=True, key="apply_limit_filters"):
+                    if not by_dur and not by_spd:
+                        st.session_state["workout_limit_cfg"] = None
+                        st.warning("⚠️ Nessun criterio selezionato: vengono considerati "
+                                   "tutti gli allenamenti.")
+                    else:
+                        st.session_state["workout_limit_cfg"] = {
+                            "by_dur": by_dur, "dur_metric": dur_metric,
+                            "n_dur": int(n_dur),
+                            "by_spd": by_spd, "n_spd": int(n_spd),
+                        }
+                if b2.button("↩️ Rimuovi filtri", use_container_width=True,
+                             key="clear_limit_filters"):
+                    st.session_state["workout_limit_cfg"] = None
+    else:
+        st.session_state["workout_limit_cfg"] = None
+
+    limit_cfg = st.session_state.get("workout_limit_cfg")
+
+    if limit_cfg and _pool:
+        keep_names, limit_msgs = select_limited_files(_pool, file_stats, limit_cfg)
+        limit_skipped = [n for n in _pool if n not in keep_names]
+
+        # i file manualmente esclusi restano in lista: servono a mostrare il
+        # bottone "Reincludi". Restano anche quelli in errore (niente stats).
+        fit_uploads = [
+            u for u in fit_uploads
+            if u[0] not in file_stats or u[0] in keep_names or u[0] in excluded_files
+        ]
+
+        _attivi = []
+        if limit_cfg["by_dur"]:
+            _attivi.append(f"{limit_cfg['n_dur']} allenamenti più lunghi per «{limit_cfg['dur_metric']}»")
+        if limit_cfg["by_spd"]:
+            _attivi.append(f"{limit_cfg['n_spd']} allenamenti più veloci per EFS media")
+        st.success(
+            f"✅ Il filtro ha mantenuto i {' e i '.join(_attivi)}: "
+            f"**{len(keep_names)}** allenamenti su {len(_pool)} in analisi."
+        )
+
+        for _m in limit_msgs:
+            st.info(f"ℹ️ {_m}")
+
+        if limit_skipped:
+            with st.expander(f"✂️ {len(limit_skipped)} allenamenti esclusi dal filtro"):
+                st.dataframe(
+                    pd.DataFrame([{
+                        "File": n,
+                        "Durata": seconds_to_hhmm(file_stats[n]["dur_s"]),
+                        "Distanza (km)": round(file_stats[n]["dist_km"], 2),
+                        "EFD (km)": round(file_stats[n]["efd_km"], 2),
+                        "EFS media (km/h)": round(file_stats[n]["efs"], 2),
+                    } for n in limit_skipped]),
+                    use_container_width=True, hide_index=True,
+                )
+
+    st.divider()
+
+    active_uploads = [u for u in fit_uploads if u[0] not in excluded_files]
 
     # --- filtri automatici: sport e durata --------------------------------------
     # Girano PRIMA del rendering: con un export massivo (centinaia di file)
@@ -1558,6 +1781,39 @@ with tab_training:
     # esiste davvero. Senza container il riepilogo potrebbe solo stare in fondo,
     # perché Streamlit disegna nell'ordine in cui il codice viene eseguito.
     summary_slot = st.container()
+
+    # ------------------------------------------------------------------
+    # Ordinamento del dettaglio per singolo allenamento
+    # ------------------------------------------------------------------
+    # Riordina solo la lista già filtrata: non tocca il riepilogo, che è
+    # un'aggregazione e non dipende dall'ordine. I file in errore (senza
+    # statistiche) finiscono in fondo in qualunque direzione, così non si
+    # infilano tra i risultati validi.
+    SORT_KEYS = {
+        "Data": "start_ts",
+        "Durata": "dur_s",
+        "Distanza": "dist_km",
+        "EFD": "efd_km",
+        "Dislivello +": "d_plus_m",
+        "Dislivello −": "d_minus_m",
+        "Velocità media (EFS)": "efs",
+    }
+
+    if fit_uploads:
+        s1, s2 = st.columns([2, 1])
+        sort_by = s1.selectbox(
+            "Ordina gli allenamenti per:", list(SORT_KEYS), key="sort_workouts_by",
+        )
+        sort_desc = s2.radio(
+            "Direzione:", ["Decrescente", "Crescente"],
+            horizontal=True, key="sort_workouts_dir",
+        ) == "Decrescente"
+
+        _key = SORT_KEYS[sort_by]
+        _with_stats = [u for u in fit_uploads if u[0] in file_stats]
+        _without = [u for u in fit_uploads if u[0] not in file_stats]
+        _with_stats.sort(key=lambda u: file_stats[u[0]][_key], reverse=sort_desc)
+        fit_uploads = _with_stats + _without
 
     for fit_name, fit_bytes, _fit_ext in fit_uploads:
         is_excluded = fit_name in excluded_files
@@ -1718,7 +1974,7 @@ with tab_training:
 
 
 with tab_race:
-    st.header("🎯 Gara e profilo di corsa")
+    st.header("🔮 Predizione")
 
     # --- 1. Percorso gara --------------------------------------------------
     st.subheader("1️⃣ Percorso gara (GPX o FIT)")
@@ -1867,23 +2123,37 @@ with tab_race:
 
     st.divider()
 
-    # --- 3. Vincoli orari per zona -------------------------------------------
-    st.subheader("3️⃣ Tempi massimi per zona (Z1 - Z5)")
+    # --- 3. Riepilogo allenamenti --------------------------------------------
+    # Stessa tabella della scheda 📊 Allenamenti, riportata identica: quando la
+    # fonte è un CSV importato il riepilogo completo non esiste e si ripiega
+    # sulla sola tabella dei minutaggi massimi.
+    st.subheader("3️⃣ Riepilogo allenamenti per zona")
 
-    if max_minutes_by_zone:
-        st.caption(
-            "📏 Minutaggio massimo per zona, in base alla fonte dati selezionata al punto 2️⃣:"
+    _riepilogo = st.session_state.get("final_summary_df")
+    _da_sessione = efs_source == "Usa il riepilogo calcolato in questa sessione"
+
+    if _da_sessione and _riepilogo is not None and not _riepilogo.empty:
+        st.dataframe(
+            _riepilogo.style.format({
+                "EFD totale (km)": "{:.2f}",
+                "EFS media (km/h)": "{:.2f}",
+            }),
+            use_container_width=True, hide_index=True,
         )
-        max_rows = [
-            {"Zona": z, "Durata massima (min)": max_minutes_by_zone[z]}
-            for z in ["Z1", "Z2", "Z3", "Z4", "Z5"]
-            if z in max_minutes_by_zone
-        ]
-        st.dataframe(pd.DataFrame(max_rows), use_container_width=True, hide_index=True)
+    elif max_minutes_by_zone:
+        st.caption("📏 Minutaggio massimo per zona, dai dati importati al punto 2️⃣:")
+        st.dataframe(
+            pd.DataFrame([
+                {"Zona": z, "Durata massima (min)": max_minutes_by_zone[z]}
+                for z in ["Z1", "Z2", "Z3", "Z4", "Z5"] if z in max_minutes_by_zone
+            ]),
+            use_container_width=True, hide_index=True,
+        )
     else:
         st.caption(
-            "ℹ️ Nessun minutaggio massimo disponibile: carica ed elabora i file di allenamento "
-            "nella scheda **📊 Allenamenti**, oppure importa un CSV con la colonna 'Durata massima (min)'."
+            "ℹ️ Nessun dato disponibile: carica ed elabora i file di allenamento "
+            "nella scheda **📊 Allenamenti**, oppure importa un CSV con la colonna "
+            "'Durata massima (min)'."
         )
 
     st.divider()
@@ -2199,7 +2469,7 @@ with tab_plan:
 
     if not prediction_ready:
         st.info(
-            "ℹ️ Calcola prima una previsione nella scheda **🎯 Gara e profilo**, "
+            "ℹ️ Calcola prima una previsione nella scheda **🔮 Predizione**, "
         "poi qui potrai costruire il race plan."
         )
     else:
@@ -2215,7 +2485,7 @@ with tab_plan:
             race_total_km = st.session_state.get("race_total_km")
 
             if race_profile is None or race_total_km is None:
-                st.error("⚠️ Profilo del percorso non disponibile: ricarica il file gara nella scheda **🎯 Gara e profilo**.")
+                st.error("⚠️ Profilo del percorso non disponibile: ricarica il file gara nella scheda **🔮 Predizione**.")
             else:
                 st.caption(
                     f"Distanza totale percorso: **{race_total_km:.2f} km**. "
@@ -2407,8 +2677,8 @@ with tab_export:
 
     # --- Intestazione ---------------------------------------------------------
     # Questi campi stanno FUORI dal controllo su plan_state di proposito: i nomi
-    # dei profili vengono letti da render_profile_selector (scheda 🎯 Gara e
-    # profilo), che gira prima di questa, quindi devono essere compilabili anche
+    # dei profili vengono letti da render_profile_selector (scheda 🔮 Predizione),
+    # che gira prima di questa, quindi devono essere compilabili anche
     # quando un race plan non esiste ancora. Lo stesso vale per il nome atleta,
     # usato anche dal CSV delle zone nella scheda ❤️ Zone FC.
     st.subheader("Intestazione del report")

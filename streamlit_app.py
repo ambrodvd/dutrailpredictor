@@ -1584,7 +1584,7 @@ with tab_training:
                 with c_dur:
                     by_dur = st.checkbox("Analizza gli allenamenti più lunghi",
                                          key="limit_by_duration")
-                    st.caption("Questo filtro ti consente di tenere solo gli allenamenti più lunghi")
+                    st.caption("Questo filtro ti consente di tenere gli allenamenti più lunghi")
                     dur_metric = st.radio(
                         "Criterio di lunghezza:", list(LIMIT_METRICS),
                         key="limit_duration_metric", disabled=not by_dur,

@@ -1455,7 +1455,7 @@ with tab_hr:
 
     st.markdown(':red[Imposta le zone cardiache per una corretta analisi degli allenamenti:]')
 
-    input_method = st.radio("Metodo di input:", ["Manuale", "Importa CSV"], horizontal=True)
+    input_method = st.radio("Metodo di input:", ["Importa CSV", "Manuale"], horizontal=True)
 
     if input_method == "Manuale":
         with st.form("hr_zones_form"):
@@ -2845,8 +2845,7 @@ with tab_export:
         else:
             st.caption(
                 "Scegli quali colonne finiscono nella tabella del PDF: "
-                "meno colonne significa caratteri più grandi e un foglio "
-                "più leggibile da tasca."
+                "meno colonne significa caratteri"
             )
 
             checkbox_cols = st.columns(3)

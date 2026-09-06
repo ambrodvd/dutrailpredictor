@@ -988,6 +988,72 @@ def build_plan_for_profile(result, label, race_profile, laps_df):
     return out, calib_factor
 
 
+
+def current_profile_names(fallbacks: list[str]) -> list[str]:
+    """Nomi profilo CORRENTI (scheda 📄 Export), con fallback sui nomi con cui
+    il piano era stato calcolato. Replica la disambiguazione A/B usata in
+    render_profile_selector: due profili omonimi genererebbero colonne
+    duplicate nel piano di confronto."""
+    keys = (["race_profile_name"] if len(fallbacks) == 1
+            else ["race_a_profile_name", "race_b_profile_name"])
+    names = [(st.session_state.get(k) or "").strip() or fb
+             for k, fb in zip(keys, fallbacks)]
+    if len(names) == 2 and names[0] == names[1]:
+        names = [f"{names[0]} (A)", f"{names[1]} (B)"]
+    return names
+
+
+def format_calib_caption(calib_values, labels) -> str:
+    if len(calib_values) == 1:
+        return f"Fattore di calibrazione applicato: ×{calib_values[0]:.3f}"
+    return "Fattore di calibrazione: " + " · ".join(
+        f"{lab} ×{c:.3f}" for lab, c in zip(labels, calib_values)
+    )
+
+
+def resolve_plan_state(plan_state: dict):
+    """Riapplica al piano salvato i nomi dei profili correnti.
+
+    Il piano viene calcolato una volta sola e messo in session_state, ma i
+    nomi dei profili sono rinominabili DOPO, nella scheda 📄 Export: senza
+    questa risoluzione l'intestazione del PDF e le colonne del confronto
+    resterebbero al nome del preset con cui il piano era stato generato.
+
+    Ritorna (plan_df, display_cols, labels, calib_caption, meta_lines).
+    """
+    old_labels = plan_state.get("labels") or []
+
+    if not old_labels:
+        # piano salvato da una versione precedente dell'app
+        return (plan_state["plan_df"], plan_state["display_cols"], [],
+                plan_state.get("calib_caption", ""),
+                list(plan_state.get("meta", [])))
+
+    new_labels = current_profile_names(old_labels)
+
+    rename_map = {}
+    for old, new in zip(old_labels, new_labels):
+        if old == new:
+            continue
+        for c in plan_state["plan_df"].columns:
+            if f"({old})" in c:
+                rename_map[c] = c.replace(f"({old})", f"({new})")
+
+    plan_df = plan_state["plan_df"].rename(columns=rename_map)
+    display_cols = [rename_map.get(c, c) for c in plan_state["display_cols"]]
+
+    times = plan_state.get("times_h") or []
+    if len(new_labels) == 1:
+        meta = [f"Profilo: {new_labels[0]}",
+                f"Tempo previsto: {seconds_to_hhmm(times[0] * 3600)}"]
+    else:
+        meta = [f"{lab}: {seconds_to_hhmm(t * 3600)}"
+                for lab, t in zip(new_labels, times)]
+    meta.append(f"EFD totale: {plan_state.get('efd_km', float('nan')):.2f} km")
+
+    return (plan_df, display_cols, new_labels,
+            format_calib_caption(plan_state.get("calib", []), new_labels), meta)
+
 # ---------------------------------------------------------------------------
 # Export PDF del Race Plan
 # ---------------------------------------------------------------------------
@@ -2592,12 +2658,13 @@ with tab_plan:
                                 "plan_df": plan_df,
                                 "display_cols": display_cols,
                                 "chart_png": fig_to_png_bytes(fig),
-                                "calib_caption": f"Fattore di calibrazione applicato: ×{calib:.3f}",
-                                "meta": [
-                                    f"Profilo: {label_single}",
-                                    f"Tempo previsto: {seconds_to_hhmm(result['race_time_h'] * 3600)}",
-                                    f"EFD totale: {result['total_efd_km']:.2f} km",
-                                ],
+                                # niente "meta"/"calib_caption" congelati: i nomi
+                                # dei profili sono rinominabili dopo il calcolo e
+                                # vengono ricomposti da resolve_plan_state.
+                                "labels": [label_single],
+                                "times_h": [result["race_time_h"]],
+                                "efd_km": result["total_efd_km"],
+                                "calib": [calib],
                                 "file_stem": "race_plan",
                             }
                             plt.close(fig)
@@ -2638,15 +2705,11 @@ with tab_plan:
                                 "plan_df": merged,
                                 "display_cols": list(merged.columns),
                                 "chart_png": fig_to_png_bytes(fig),
-                                "calib_caption": (
-                                    f"Fattore di calibrazione: {label_a} ×{calib_a:.3f} · "
-                                    f"{label_b} ×{calib_b:.3f}"
-                                ),
-                                "meta": [
-                                    f"{label_a}: {seconds_to_hhmm(result_a['race_time_h'] * 3600)}",
-                                    f"{label_b}: {seconds_to_hhmm(result_b['race_time_h'] * 3600)}",
-                                    f"EFD totale: {result_a['total_efd_km']:.2f} km",
-                                ],
+                                "labels": [label_a, label_b],
+                                "times_h": [result_a["race_time_h"],
+                                            result_b["race_time_h"]],
+                                "efd_km": result_a["total_efd_km"],
+                                "calib": [calib_a, calib_b],
                                 "file_stem": "race_plan_confronto",
                             }
                             plt.close(fig)
@@ -2657,10 +2720,9 @@ with tab_plan:
     plan_state = st.session_state.get("race_plan_data")
 
     if plan_state:
-        plan_df = plan_state["plan_df"]
-        display_cols = plan_state["display_cols"]
+        plan_df, display_cols, _labels_now, _calib_caption, _ = resolve_plan_state(plan_state)
 
-        st.caption(plan_state["calib_caption"])
+        st.caption(_calib_caption)
         st.dataframe(
             plan_df[display_cols].style.format({
                 c: f for c, f in PLAN_COL_FORMATS.items() if c in display_cols
@@ -2699,19 +2761,33 @@ with tab_export:
         help="Obbligatorio: titolo del report e parte del nome dei file.",
     )
 
+    # I nomi dei profili vivono in un form: fuori da un form Streamlit committa
+    # il testo solo alla perdita di focus, quindi chi scriveva il nome e cliccava
+    # direttamente il download otteneva ancora il nome vecchio. Col submit il
+    # valore entra in session_state in un momento preciso e il rerun successivo
+    # lo propaga a tutte le schede (tab_race gira prima di questa, quindi la
+    # caption "Nome profilo: ..." si aggiorna subito).
     _profile_help = (
-        "Il nome entra nelle colonne del piano: dopo averlo cambiato ricalcola "
-        "il race plan per vederlo aggiornato."
+        "Il nome compare nell'intestazione del report e nelle colonne del piano "
+        "in modalità confronto. Premi «Applica» per confermarlo."
     )
-    if st.session_state.get("race_compare_mode", False):
-        c_pa, c_pb = st.columns(2)
-        c_pa.text_input("Nome del profilo A", key="race_a_profile_name",
-                        max_chars=40, help=_profile_help)
-        c_pb.text_input("Nome del profilo B", key="race_b_profile_name",
-                        max_chars=40, help=_profile_help)
-    else:
-        st.text_input("Nome del profilo", key="race_profile_name",
-                      max_chars=40, help=_profile_help)
+    with st.form("profile_names_form"):
+        if st.session_state.get("race_compare_mode", False):
+            c_pa, c_pb = st.columns(2)
+            c_pa.text_input("Nome del profilo A", key="race_a_profile_name",
+                            max_chars=40, help=_profile_help)
+            c_pb.text_input("Nome del profilo B", key="race_b_profile_name",
+                            max_chars=40, help=_profile_help)
+        else:
+            st.text_input("Nome del profilo", key="race_profile_name",
+                          max_chars=40, help=_profile_help)
+        _names_saved = st.form_submit_button("💾 Applica i nomi dei profili")
+
+    if _names_saved:
+        st.success(
+            "✅ Nomi aggiornati: il report e gli export usano i nuovi nomi "
+            "(non serve ricalcolare il race plan)."
+        )
 
     athlete = (st.session_state.get("athlete_name") or "").strip()
     race_title = (st.session_state.get("race_name") or "").strip()
@@ -2736,8 +2812,8 @@ with tab_export:
             + ", ".join(f"**{m}**" for m in mancanti) + "."
         )
     else:
-        plan_df = plan_state["plan_df"]
-        display_cols = plan_state["display_cols"]
+        plan_df, display_cols, profile_labels, calib_caption, plan_meta = \
+            resolve_plan_state(plan_state)
 
         # Nome file unico per CSV e PDF: atleta_gara_raceplan
         file_stem = f"{slugify_name(athlete)}_{slugify_name(race_title)}_raceplan"
@@ -2799,7 +2875,7 @@ with tab_export:
                      "Gli a capo vengono mantenuti.",
             )
 
-            pdf_meta = [f"Atleta: {athlete}"] + list(plan_state["meta"])
+            pdf_meta = [f"Atleta: {athlete}"] + list(plan_meta)
 
             if not selected_cols:
                 st.info("Seleziona almeno una colonna per generare il PDF.")
@@ -2811,7 +2887,7 @@ with tab_export:
                         title=race_title,
                         meta_lines=pdf_meta,
                         comment=coach_comment,
-                        note=plan_state["calib_caption"],
+                        note=calib_caption,
                     )
                     st.download_button(
                         "📄 Scarica Race Plan (PDF)",
